@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish the release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java 21
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Validate the Gradle wrapper
+        uses: gradle/actions/wrapper-validation@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      - name: Read the release version from the tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check that the tag matches the project version
+        run: |
+          built="$(./gradlew --no-daemon --quiet properties | awk '/^version:/ {print $2}')"
+          if [ "$built" != "${{ steps.version.outputs.version }}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match gradle.properties loaderVersion $built"
+            exit 1
+          fi
+
+      - name: Build and test
+        run: ./gradlew build --no-daemon --stacktrace
+
+      - name: Collect the release assets
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p release
+          cp "loader-velocity/build/libs/mcanalytics-loader-velocity-${version}.jar" release/
+          cp "loader-paper/build/libs/mcanalytics-loader-paper-${version}.jar" release/
+          cd release
+          sha256sum *.jar > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: false
+          fail_on_unmatched_files: true
+          files: |
+            release/mcanalytics-loader-velocity-${{ steps.version.outputs.version }}.jar
+            release/mcanalytics-loader-paper-${{ steps.version.outputs.version }}.jar
+            release/SHA256SUMS
