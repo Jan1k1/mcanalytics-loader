@@ -40,7 +40,7 @@ public class VelocityLoaderPlugin implements PlatformHandle {
     private final ProxyServer server;
     private final Path dataDirectory;
     private final LoaderLogger loaderLogger;
-    private final LoaderLifecycle lifecycle;
+    private volatile LoaderLifecycle lifecycle;
     private volatile CommandDelegate commandDelegate;
 
     @Inject
@@ -69,12 +69,13 @@ public class VelocityLoaderPlugin implements PlatformHandle {
                 logger.error("{}", message, throwable);
             }
         };
-
-        this.lifecycle = new LoaderLifecycle(this);
     }
 
     @Subscribe
     public void onProxyInitialize(ProxyInitializeEvent event) {
+        LoaderLifecycle lifecycle = new LoaderLifecycle(this);
+        this.lifecycle = lifecycle;
+
         CommandManager commandManager = server.getCommandManager();
         CommandMeta meta = commandManager.metaBuilder("mca")
                 .aliases("mcanalytics")
@@ -87,7 +88,10 @@ public class VelocityLoaderPlugin implements PlatformHandle {
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
-        lifecycle.onDisable();
+        LoaderLifecycle current = lifecycle;
+        if (current != null) {
+            current.onDisable();
+        }
     }
 
     @Override

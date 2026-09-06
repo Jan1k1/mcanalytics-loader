@@ -121,7 +121,7 @@ public class PaperLoaderPlugin extends JavaPlugin implements PlatformHandle {
 
     @Override
     public String loaderVersion() {
-        return getDescription().getVersion();
+        return getPluginMeta().getVersion();
     }
 
     @Override
