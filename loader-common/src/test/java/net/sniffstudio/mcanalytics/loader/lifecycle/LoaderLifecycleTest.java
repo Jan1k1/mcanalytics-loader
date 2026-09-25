@@ -20,7 +20,11 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executor;
@@ -131,6 +135,35 @@ class LoaderLifecycleTest {
         };
     }
 
+    /** A lifecycle that talks to the local mock server instead of the locked public address. */
+    private LoaderLifecycle localLifecycle(PlatformHandle handle) {
+        return new LoaderLifecycle(handle, "http://127.0.0.1:" + port, Clock.systemUTC());
+    }
+
+    /** A clock the retry and reminder tests can move by hand. */
+    private static final class MutableClock extends Clock {
+        private Instant now = Instant.parse("2026-09-25T20:28:57Z");
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+
+        void advance(Duration duration) {
+            now = now.plus(duration);
+        }
+    }
+
     private static final class TestSender implements CommandSender {
         final List<String> messages = new ArrayList<>();
 
@@ -153,7 +186,7 @@ class LoaderLifecycleTest {
     @Test
     void unPairedServerLogsPromptAndSetsUnpairedState(@TempDir Path tempDir) {
         PlatformHandle handle = createMockHandle(tempDir, "velocity");
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
 
         lifecycle.onEnable();
 
@@ -175,9 +208,7 @@ class LoaderLifecycleTest {
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "velocity", Instant.now()));
 
-        Files.writeString(tempDir.resolve("config.toml"), "endpoint_url = \"http://127.0.0.1:" + port + "\"");
-
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.PAUSED_NO_PLAN);
@@ -198,9 +229,7 @@ class LoaderLifecycleTest {
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_revoked", "net-1", "srv-1", "lobby", "paper", Instant.now()));
 
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
-
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.UNPAIRED);
@@ -220,13 +249,101 @@ class LoaderLifecycleTest {
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "velocity", Instant.now()));
 
-        // Point to closed port
-        Files.writeString(tempDir.resolve("config.toml"), "endpoint_url = \"http://127.0.0.1:1\"");
-
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        // Nothing listens on port 1.
+        LoaderLifecycle lifecycle = new LoaderLifecycle(handle, "http://127.0.0.1:1", Clock.systemUTC());
         lifecycle.onEnable();
 
-        assertThat(loggedMessages).anyMatch(msg -> msg.contains("Using cached fallback bundle"));
+        assertThat(loggedMessages).anyMatch(msg -> msg.equals("[INFO] [MCAnalytics] Cannot reach mcanalytics.org right now "
+                + "(connection failed). Starting the connector already saved on this server "
+                + "(connector-velocity-1.0.0.jar). Updates are checked again at the next restart."));
+        assertThat(loggedMessages).noneMatch(msg -> msg.startsWith("[WARN]") && msg.contains("Cannot reach"));
+        assertThat(loggedMessages).noneMatch(msg -> msg.contains("ConnectException") || msg.contains("Connection refused"));
+    }
+
+    @Test
+    void serverErrorWithoutACachedBundleWarnsOnceCalmlyAndRetries(@TempDir Path tempDir) throws Exception {
+        AtomicInteger releaseStatus = new AtomicInteger(502);
+        server.createContext("/api/v1/connector/release", exchange -> {
+            int status = releaseStatus.get();
+            byte[] response = status == 402
+                    ? "{\"error\":{\"code\":\"PLAN_REQUIRED\",\"message\":\"Plan required\"}}".getBytes(StandardCharsets.UTF_8)
+                    : "error code: 502\n".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(status, response.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response);
+            }
+        });
+
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        LoaderCredentials credentials = new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now());
+        new ConfigManager(tempDir, handle.logger()).saveCredentials(credentials);
+
+        MutableClock clock = new MutableClock();
+        LoaderLifecycle lifecycle = new LoaderLifecycle(handle, "http://127.0.0.1:" + port, clock);
+        try {
+            lifecycle.onEnable();
+
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+            assertThat(lifecycle.isOfflineRetryScheduled()).isTrue();
+            assertThat(loggedMessages).containsExactly("[WARN] [MCAnalytics] Cannot reach mcanalytics.org right now (HTTP 502). "
+                    + "Your server is fine. Analytics starts as soon as the connector can be downloaded, and the loader "
+                    + "tries again every 2 minutes. If this lasts more than 30 minutes, open a ticket in our Discord: "
+                    + "https://discord.gg/9MWENuGmYn");
+            assertThat(loggedMessages).noneMatch(msg -> msg.contains("error code") || msg.contains("\n"));
+
+            // The retries inside the next half hour stay quiet.
+            clock.advance(Duration.ofMinutes(2));
+            lifecycle.runReleaseCheckAndLoad(credentials);
+            clock.advance(Duration.ofMinutes(2));
+            lifecycle.runReleaseCheckAndLoad(credentials);
+            assertThat(loggedMessages).hasSize(1);
+
+            // Past half an hour, one short reminder.
+            clock.advance(Duration.ofMinutes(27));
+            lifecycle.runReleaseCheckAndLoad(credentials);
+            assertThat(loggedMessages).hasSize(2);
+            assertThat(loggedMessages.get(1)).isEqualTo("[WARN] [MCAnalytics] Still cannot reach mcanalytics.org (HTTP 502). "
+                    + "Trying again every 2 minutes. Discord: https://discord.gg/9MWENuGmYn");
+
+            // The site answers again: one line that says so.
+            releaseStatus.set(402);
+            lifecycle.runReleaseCheckAndLoad(credentials);
+            assertThat(loggedMessages).contains("[INFO] [MCAnalytics] Connection to mcanalytics.org is back.");
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.PAUSED_NO_PLAN);
+            assertThat(lifecycle.isOfflineRetryScheduled()).isFalse();
+            assertThat(loggedMessages).noneMatch(msg -> msg.startsWith("[ERROR]"));
+        } finally {
+            lifecycle.onDisable();
+        }
+    }
+
+    @Test
+    void serverErrorWithACachedBundleStartsItWithOneInfoLine(@TempDir Path tempDir) throws Exception {
+        server.createContext("/api/v1/connector/release", exchange -> {
+            byte[] response = "error code: 502\n".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(502, response.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response);
+            }
+        });
+
+        Path cacheDir = tempDir.resolve("cache");
+        Files.createDirectories(cacheDir);
+        Files.writeString(cacheDir.resolve("connector-paper-1.0.9.jar"), "dummy-jar-content");
+
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        new ConfigManager(tempDir, handle.logger())
+                .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+
+        LoaderLifecycle lifecycle = localLifecycle(handle);
+        lifecycle.onEnable();
+
+        assertThat(loggedMessages).contains("[INFO] [MCAnalytics] Cannot reach mcanalytics.org right now (HTTP 502). "
+                + "Starting the connector already saved on this server (connector-paper-1.0.9.jar). "
+                + "Updates are checked again at the next restart.");
+        assertThat(loggedMessages).noneMatch(msg -> msg.startsWith("[WARN]"));
+        assertThat(loggedMessages).noneMatch(msg -> msg.contains("error code"));
+        assertThat(lifecycle.isOfflineRetryScheduled()).isFalse();
     }
 
     @Test
@@ -249,9 +366,8 @@ class LoaderLifecycleTest {
         });
 
         PlatformHandle handle = createMockHandle(tempDir, "paper");
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
 
         TestSender sender = new TestSender();
@@ -286,9 +402,8 @@ class LoaderLifecycleTest {
         });
 
         PlatformHandle handle = createMockHandle(tempDir, "paper");
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
 
         AtomicBoolean stopped = new AtomicBoolean(false);
         ConnectorEntrypoint fakeEntrypoint = new ConnectorEntrypoint() {
@@ -333,18 +448,34 @@ class LoaderLifecycleTest {
     }
 
     @Test
-    void badEndpointUrlSetsFailedStateAndLogsError(@TempDir Path tempDir) throws Exception {
+    void addressInAnOldConfigIsIgnoredAndReportedOnce(@TempDir Path tempDir) throws Exception {
+        server.createContext("/api/v1/connector/release", exchange -> {
+            byte[] response = "{\"error\":{\"code\":\"PLAN_REQUIRED\",\"message\":\"Plan required\"}}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(402, response.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response);
+            }
+        });
+
         PlatformHandle handle = createMockHandle(tempDir, "paper");
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
 
+        // An address older loaders honoured, and one they would have refused outright.
         Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://10.0.0.5:3000\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
+        lifecycle.onEnable();
         lifecycle.onEnable();
 
-        assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
-        assertThat(loggedMessages).anyMatch(msg -> msg.contains("[ERROR]") && msg.contains("10.0.0.5:3000"));
+        assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.PAUSED_NO_PLAN);
+        assertThat(loggedMessages)
+                .filteredOn(msg -> msg.equals("[INFO] [MCAnalytics] The address setting in config.yml is no longer used. "
+                        + "MCAnalytics always connects to mcanalytics.org."))
+                .hasSize(1);
+        assertThat(loggedMessages).noneMatch(msg -> msg.contains("10.0.0.5"));
+        assertThat(loggedMessages).noneMatch(msg -> msg.startsWith("[ERROR]"));
+        lifecycle.onDisable();
     }
 
     @Test
@@ -358,9 +489,8 @@ class LoaderLifecycleTest {
         });
 
         PlatformHandle handle = createMockHandle(tempDir, "paper");
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
 
         AtomicBoolean stopped = new AtomicBoolean(false);
         ConnectorEntrypoint fakeEntrypoint = new ConnectorEntrypoint() {
@@ -408,7 +538,7 @@ class LoaderLifecycleTest {
     @Test
     void unPairedStartupRegistersPairCommandAndAnswersEveryOtherSubcommand(@TempDir Path tempDir) {
         PlatformHandle handle = createMockHandle(tempDir, "paper");
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
 
         lifecycle.onEnable();
 
@@ -432,9 +562,8 @@ class LoaderLifecycleTest {
         });
 
         PlatformHandle handle = createMockHandle(tempDir, "paper");
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.UNPAIRED);
@@ -447,6 +576,7 @@ class LoaderLifecycleTest {
         PlatformHandle handle = createMockHandle(tempDir, "velocity");
         Files.writeString(tempDir.resolve("config.toml"), "endpoint_url = \"https://staging.example.com\"");
 
+        // The public constructor: the address in config.toml must not be used.
         LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
         lifecycle.onEnable();
 
@@ -455,8 +585,11 @@ class LoaderLifecycleTest {
 
         assertThat(sender.messages).anyMatch(msg -> msg.contains("Loader 1.0.0 on velocity"));
         assertThat(sender.messages).anyMatch(msg -> msg.contains("State: UNPAIRED"));
-        assertThat(sender.messages).anyMatch(msg -> msg.contains("Endpoint: https://staging.example.com"));
+        assertThat(sender.messages).anyMatch(msg -> msg.contains("Endpoint: https://mcanalytics.org."));
+        assertThat(sender.messages).noneMatch(msg -> msg.contains("staging.example.com"));
         assertThat(sender.messages).anyMatch(msg -> msg.contains("Bundle: none loaded"));
+        assertThat(loggedMessages).contains("[INFO] [MCAnalytics] The address setting in config.toml is no longer used. "
+                + "MCAnalytics always connects to mcanalytics.org.");
     }
 
     @Test
@@ -464,9 +597,8 @@ class LoaderLifecycleTest {
         PlatformHandle handle = createMockHandle(tempDir, "paper");
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_secret_value", "net-42", "srv-42", "lobby", "paper", Instant.now()));
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:1\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
 
         TestSender sender = new TestSender();
         assertThat(lifecycle.handleCommand(sender, new String[]{"status"})).isTrue();
@@ -479,7 +611,7 @@ class LoaderLifecycleTest {
     @Test
     void updateOnAnUnpairedServerAsksForPairingInstead(@TempDir Path tempDir) {
         PlatformHandle handle = createMockHandle(tempDir, "paper");
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
 
         TestSender sender = new TestSender();
         assertThat(lifecycle.handleCommand(sender, new String[]{"update"})).isTrue();
@@ -501,9 +633,8 @@ class LoaderLifecycleTest {
         PlatformHandle handle = createMockHandle(tempDir, "paper");
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
         assertThat(releaseCalls.get()).isEqualTo(1);
 
@@ -536,9 +667,8 @@ class LoaderLifecycleTest {
         PlatformHandle handle = createMockHandle(tempDir, "paper");
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
@@ -573,9 +703,8 @@ class LoaderLifecycleTest {
         PlatformHandle handle = createMockHandle(tempDir, "paper");
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
 
         Path installed = tempDir.resolve("cache").resolve("connector-paper-3.2.0.jar");
@@ -609,9 +738,8 @@ class LoaderLifecycleTest {
         PlatformHandle handle = createMockHandle(tempDir, "paper");
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
-        Files.writeString(tempDir.resolve("config.yml"), "endpoint-url: \"http://127.0.0.1:" + port + "\"");
 
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle);
+        LoaderLifecycle lifecycle = localLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(loggedMessages).anyMatch(msg -> msg.contains("older than required minLoader 9.0.0"));
