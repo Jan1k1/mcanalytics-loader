@@ -35,7 +35,7 @@ import java.util.concurrent.Executor;
 )
 public class VelocityLoaderPlugin implements PlatformHandle {
 
-    public static final String VERSION = "1.0.1";
+    public static final String VERSION = "1.0.2";
 
     private final ProxyServer server;
     private final Path dataDirectory;

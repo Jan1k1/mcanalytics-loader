@@ -28,7 +28,7 @@ All three commands need console access or the `mcanalytics.admin` permission.
 | Command | What it does |
 | --- | --- |
 | `/mca pair <code>` | Trades a pairing code from the dashboard for a connector credential, saves it, then downloads and starts the connector. |
-| `/mca status` | Prints the loader version, the current state, the endpoint in use, the paired server and network, and the loaded bundle. It never prints the token. |
+| `/mca status` | Prints the loader version, the current state, the address it talks to, the paired server and network, and the loaded bundle. It never prints the token. |
 | `/mca update` | Checks the release API again, downloads a newer connector if there is one, and restarts it. |
 
 `/mcanalytics` is an alias for `/mca`. Any other subcommand is passed to the running connector.
@@ -41,23 +41,23 @@ The loader can be in one of five states, which `/mca status` reports:
 | `CHECKING` | Talking to the release API, or starting the connector. |
 | `PAUSED_NO_PLAN` | The network has no active plan. The loader re-checks every 30 minutes. |
 | `ACTIVE` | The connector is running. |
-| `FAILED` | No usable connector bundle. The console log says why. |
+| `FAILED` | No usable connector bundle. The console log says why. When the cause is that mcanalytics.org cannot be reached, the loader tries again every 2 minutes on its own. |
 
 ## Configuration
 
-The loader needs no configuration for normal use. Every key below is optional.
+The loader needs no configuration. It always talks to `https://mcanalytics.org`, and that address
+cannot be changed in a config file or an environment variable.
+
+Older versions read an address from `endpoint_url` / `api_url` in `config.toml`, `endpoint-url` /
+`api-url` in `config.yml`, and the `MCANALYTICS_ENDPOINT_URL`, `MCANALYTICS_API_URL` and
+`MCANALYTICS_DASHBOARD_URL` environment variables. All of them are ignored now. When an old config
+file still has one of those keys, the console says so once at startup, and you can delete the line.
+
+One setting remains, and it is optional:
 
 | Key | Where | Default |
 | --- | --- | --- |
-| `endpoint_url` (or `api_url`) | `plugins/<loader data folder>/config.toml` | `https://mcanalytics.org` |
-| `endpoint-url` (or `api-url`) | `plugins/<loader data folder>/config.yml` | `https://mcanalytics.org` |
-| `MCANALYTICS_ENDPOINT_URL` (or `MCANALYTICS_API_URL`) | environment variable | unset |
-| `MCANALYTICS_DASHBOARD_URL` | environment variable | derived from the endpoint |
 | `MCANALYTICS_API_TOKEN` | environment variable | unset |
-
-The order is environment variable, then `config.toml`, then `config.yml`, then the default. The
-endpoint must use HTTPS. Plain HTTP is accepted only for `localhost` and `127.0.0.1`, which is there
-for local development against a test instance.
 
 `MCANALYTICS_API_TOKEN` lets a container image start already paired. The loader accepts a token that
 starts with `mca_live_` or `mca_test_`. A credential file on disk always wins over the variable.
@@ -83,7 +83,14 @@ manifest with the bundle `version`, its `sha256`, its `sizeBytes`, a `downloadPa
   bundle is never installed or run.
 - Only a verified file is moved into the cache and loaded.
 - If the API cannot be reached, the loader falls back to the newest bundle already in its cache, so
-  a network outage does not take your analytics down.
+  a network outage does not take your analytics down. The console gets one calm line that says so,
+  for example `Cannot reach mcanalytics.org right now (HTTP 502). Starting the connector already
+  saved on this server (connector-paper-1.0.10.jar).` Only the HTTP status or a short cause (`timed
+  out`, `address lookup failed`, `connection failed`) is shown, never a raw error page.
+- If the API cannot be reached and nothing is cached yet, the loader prints one warning, tries again
+  every 2 minutes, and repeats a short reminder at most every 30 minutes until the connection is
+  back. If that lasts more than 30 minutes, open a ticket in our Discord:
+  https://discord.gg/9MWENuGmYn
 - If the loader is older than `minLoader`, it logs a warning telling you to download a newer loader,
   and still tries to run the bundle.
 - HTTP 402 means the network has no active plan. The loader pauses and re-checks every 30 minutes.
@@ -91,8 +98,8 @@ manifest with the bundle `version`, its `sha256`, its `sizeBytes`, a `downloadPa
 
 ## Security notes
 
-What the loader downloads: one jar, the MCAnalytics connector for your platform, from the endpoint
-in your configuration. Nothing else.
+What the loader downloads: one jar, the MCAnalytics connector for your platform, from
+`https://mcanalytics.org`. Nothing else.
 
 How it checks the download: the release manifest carries a SHA-256 and a byte size. The loader
 verifies both before the file is moved into place. A bundle that fails either check is deleted and
@@ -104,7 +111,8 @@ is isolated from the rest of your plugins and can be stopped and replaced withou
 What the loader never does:
 
 - It never prints the connector token, in a log line or in a command reply.
-- It never accepts a plain HTTP endpoint outside `localhost` and `127.0.0.1`.
+- It never talks to any address but `https://mcanalytics.org`, whatever a config file or the
+  environment says.
 - It never runs a bundle whose checksum does not match the manifest.
 - It never reads or writes outside its own plugin data folder.
 - It never contacts the release API before the server is paired.

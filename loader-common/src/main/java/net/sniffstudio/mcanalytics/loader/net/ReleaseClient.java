@@ -75,7 +75,26 @@ public final class ReleaseClient {
 
     public record ReleaseMetadata(String platform, String version, String sha256, long sizeBytes, String downloadPath, String minLoader) {}
 
+    /**
+     * @param errorMessage for an unanswered request, plain words from {@link ConnectionProblem}
+     *                     ("timed out", "connection failed", ...); never a raw exception message
+     */
     public record ReleaseCheckResult(int statusCode, ReleaseMetadata metadata, String errorMessage) {}
+
+    /** A download that got an answer other than 200. Carries only the status, never the body. */
+    public static final class DownloadStatusException extends IOException {
+        private static final long serialVersionUID = 1L;
+        private final int statusCode;
+
+        public DownloadStatusException(int statusCode) {
+            super("Download failed with HTTP status " + statusCode);
+            this.statusCode = statusCode;
+        }
+
+        public int statusCode() {
+            return statusCode;
+        }
+    }
 
     public PairResult pair(String apiUrl, String code, String platform) {
         validateEndpointUrl(apiUrl);
@@ -112,6 +131,11 @@ public final class ReleaseClient {
                 }
             }
 
+            if (status >= 500 && status <= 599) {
+                return new PairResult(false, status, null, "Cannot reach " + ConnectionProblem.PUBLIC_HOST
+                        + " right now (HTTP " + status + "). Your code was not used, so try again in a minute.");
+            }
+
             String errorMsg = "Pairing failed (HTTP " + status + ")";
             try {
                 Map<String, Object> json = TinyJson.parseObject(response.body());
@@ -126,7 +150,8 @@ public final class ReleaseClient {
 
             return new PairResult(false, status, null, errorMsg);
         } catch (Exception e) {
-            return new PairResult(false, 0, null, "Could not reach MCAnalytics pairing service: " + e.getMessage());
+            return new PairResult(false, 0, null, "Cannot reach " + ConnectionProblem.PUBLIC_HOST + " right now ("
+                    + ConnectionProblem.describe(e) + "). Your code was not used, so try again in a minute.");
         }
     }
 
@@ -167,6 +192,11 @@ public final class ReleaseClient {
             }
 
             String errorMsg = "HTTP " + status;
+            if (ConnectionProblem.isConnectionStatus(status)) {
+                // An edge answers a deploy with a text body such as "error code: 502". The status
+                // says everything an operator needs.
+                return new ReleaseCheckResult(status, null, errorMsg);
+            }
             try {
                 Map<String, Object> json = TinyJson.parseObject(response.body());
                 Map<String, Object> errObj = TinyJson.getObject(json, "error");
@@ -180,7 +210,10 @@ public final class ReleaseClient {
 
             return new ReleaseCheckResult(status, null, errorMsg);
         } catch (Exception e) {
-            return new ReleaseCheckResult(0, null, e.getMessage());
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return new ReleaseCheckResult(0, null, ConnectionProblem.describe(e));
         }
     }
 
@@ -196,7 +229,12 @@ public final class ReleaseClient {
 
         HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
         if (response.statusCode() != 200) {
-            throw new IOException("Download failed with HTTP status " + response.statusCode());
+            try {
+                // Read nothing, only release the connection.
+                response.body().close();
+            } catch (IOException ignored) {
+            }
+            throw new DownloadStatusException(response.statusCode());
         }
 
         MessageDigest digest = MessageDigest.getInstance("SHA-256");

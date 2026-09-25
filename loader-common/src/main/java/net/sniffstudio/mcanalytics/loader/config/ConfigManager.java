@@ -5,6 +5,7 @@ import net.sniffstudio.mcanalytics.loader.util.FilePermissions;
 import net.sniffstudio.mcanalytics.loader.util.TinyJson;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -15,64 +16,121 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.UnaryOperator;
 
 public final class ConfigManager {
 
+    /** The only address the loader talks to. Operators cannot change it. */
     public static final String DEFAULT_API_URL = "https://mcanalytics.org";
+    static final String PUBLIC_HOST = "mcanalytics.org";
+
+    /**
+     * Internal hook for local development and automated tests. Not documented to operators, and
+     * honoured only when it points at this machine, so it can never send a server's token to
+     * another host.
+     */
+    static final String INTERNAL_ENDPOINT_PROPERTY = "mcanalytics.internal.testEndpoint";
+
+    /** Address keys older loaders and connectors read. They are ignored now. */
+    static final List<String> LEGACY_TOML_ADDRESS_KEYS = List.of("endpoint_url", "api_url", "dashboard_url");
+    static final List<String> LEGACY_YML_ADDRESS_KEYS = List.of("endpoint-url", "api-url", "dashboard-url");
+
     private static final String CREDENTIAL_FILE_NAME = "credential.json";
     private static final String LEGACY_CREDENTIAL_FILE_NAME = "credentials.json";
 
     private final Path dataDirectory;
     private final LoaderLogger logger;
+    private final UnaryOperator<String> systemProperties;
+    private final AtomicBoolean ignoredAddressNoticeLogged = new AtomicBoolean(false);
 
     public ConfigManager(Path dataDirectory, LoaderLogger logger) {
-        this.dataDirectory = dataDirectory;
-        this.logger = logger;
+        this(dataDirectory, logger, System::getProperty);
     }
 
+    ConfigManager(Path dataDirectory, LoaderLogger logger, UnaryOperator<String> systemProperties) {
+        this.dataDirectory = dataDirectory;
+        this.logger = logger;
+        this.systemProperties = systemProperties != null ? systemProperties : name -> null;
+    }
+
+    /**
+     * Always {@value #DEFAULT_API_URL}. An address in config.yml, config.toml or the environment
+     * is ignored; see {@link #logIgnoredAddressSettingOnce()}.
+     */
     public String resolveApiUrl() {
-        String envUrl = System.getenv("MCANALYTICS_ENDPOINT_URL");
-        if (envUrl == null || envUrl.isBlank()) {
-            envUrl = System.getenv("MCANALYTICS_API_URL");
-        }
-        if (envUrl != null && !envUrl.isBlank()) {
-            return trimTrailingSlash(envUrl.trim());
-        }
-
-        Path tomlFile = dataDirectory.resolve("config.toml");
-        if (Files.isRegularFile(tomlFile)) {
-            String val = readKeyFromLineFile(tomlFile, "endpoint_url");
-            if (val == null) {
-                val = readKeyFromLineFile(tomlFile, "api_url");
-            }
-            if (val != null && !val.isBlank()) {
-                return trimTrailingSlash(val.trim());
-            }
-        }
-
-        Path ymlFile = dataDirectory.resolve("config.yml");
-        if (Files.isRegularFile(ymlFile)) {
-            String val = readKeyFromLineFile(ymlFile, "endpoint-url");
-            if (val == null) {
-                val = readKeyFromLineFile(ymlFile, "api-url");
-            }
-            if (val != null && !val.isBlank()) {
-                return trimTrailingSlash(val.trim());
-            }
-        }
-
-        return DEFAULT_API_URL;
+        String internal = internalEndpoint(systemProperties.apply(INTERNAL_ENDPOINT_PROPERTY));
+        return internal != null ? internal : DEFAULT_API_URL;
     }
 
     public String resolveDashboardUrl(String apiUrl) {
-        String envDash = System.getenv("MCANALYTICS_DASHBOARD_URL");
-        if (envDash != null && !envDash.isBlank()) {
-            return trimTrailingSlash(envDash.trim());
+        if (apiUrl == null || apiUrl.isBlank()) {
+            return DEFAULT_API_URL;
         }
         if (apiUrl.contains("/api")) {
             return apiUrl.substring(0, apiUrl.indexOf("/api"));
         }
         return apiUrl;
+    }
+
+    /**
+     * Says once, at INFO, that an address left in an old config file is not used any more. The
+     * value itself is never printed.
+     *
+     * @return true when the notice was logged by this call
+     */
+    public boolean logIgnoredAddressSettingOnce() {
+        String file = findIgnoredAddressSetting();
+        if (file == null || !ignoredAddressNoticeLogged.compareAndSet(false, true)) {
+            return false;
+        }
+        logger.info("[MCAnalytics] The address setting in " + file + " is no longer used. "
+                + "MCAnalytics always connects to " + PUBLIC_HOST + ".");
+        return true;
+    }
+
+    /**
+     * @return the name of the first config file in the data folder that still carries an address
+     *         key, or null when there is none
+     */
+    String findIgnoredAddressSetting() {
+        Path tomlFile = dataDirectory.resolve("config.toml");
+        if (Files.isRegularFile(tomlFile) && containsAnyKey(tomlFile, LEGACY_TOML_ADDRESS_KEYS)) {
+            return "config.toml";
+        }
+        Path ymlFile = dataDirectory.resolve("config.yml");
+        if (Files.isRegularFile(ymlFile) && containsAnyKey(ymlFile, LEGACY_YML_ADDRESS_KEYS)) {
+            return "config.yml";
+        }
+        return null;
+    }
+
+    /**
+     * The internal override, or null when it is unset or points anywhere but this machine.
+     */
+    static String internalEndpoint(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String trimmed = trimTrailingSlash(value.trim());
+        try {
+            URI uri = URI.create(trimmed);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme == null || host == null) {
+                return null;
+            }
+            if (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https")) {
+                return null;
+            }
+            boolean loopback = host.equalsIgnoreCase("localhost")
+                    || host.equals("127.0.0.1")
+                    || host.equals("[::1]")
+                    || host.equals("::1");
+            return loopback ? trimmed : null;
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     public Optional<LoaderCredentials> readCredentials() {
@@ -159,39 +217,40 @@ public final class ConfigManager {
     }
 
     private static String trimTrailingSlash(String s) {
-        if (s.endsWith("/")) {
-            return s.substring(0, s.length() - 1);
+        String result = s;
+        while (result.endsWith("/")) {
+            result = result.substring(0, result.length() - 1);
         }
-        return s;
+        return result;
     }
 
     private static boolean isValidToken(String token) {
         return token.startsWith("mca_live_") || token.startsWith("mca_test_");
     }
 
-    private static String readKeyFromLineFile(Path path, String key) {
+    /**
+     * True when the file sets one of the keys, at any indentation, in either the {@code key: value}
+     * or the {@code key = value} form. Comments are skipped. A file that cannot be read has none.
+     */
+    static boolean containsAnyKey(Path path, List<String> keys) {
         try {
-            List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
-            for (String line : lines) {
+            for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
                 String trimmed = line.trim();
-                if (trimmed.startsWith("#") || trimmed.startsWith("//")) {
+                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("//")) {
                     continue;
                 }
-                if (trimmed.startsWith(key)) {
-                    int eq = trimmed.indexOf('=');
-                    if (eq == -1) {
-                        eq = trimmed.indexOf(':');
+                for (String key : keys) {
+                    if (!trimmed.startsWith(key)) {
+                        continue;
                     }
-                    if (eq != -1) {
-                        String val = trimmed.substring(eq + 1).trim();
-                        if ((val.startsWith("\"") && val.endsWith("\"")) || (val.startsWith("'") && val.endsWith("'"))) {
-                            val = val.substring(1, val.length() - 1);
-                        }
-                        return val;
+                    String rest = trimmed.substring(key.length()).trim();
+                    if (rest.startsWith(":") || rest.startsWith("=")) {
+                        return true;
                     }
                 }
             }
-        } catch (Exception ignored) {}
-        return null;
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 }

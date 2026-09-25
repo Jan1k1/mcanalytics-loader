@@ -29,6 +29,6 @@ security@mcanalytics.org as well, and say which part is affected.
 
 The loader stores one secret, the connector token, in `credential.json` inside its plugin data
 folder, with mode 600 where the filesystem supports POSIX permissions. It never writes the token to
-a log or a command reply. It only talks to the endpoint in its configuration, which must be HTTPS
-outside `localhost`. It only runs a downloaded bundle whose SHA-256 and byte size match the release
+a log or a command reply. It only talks to `https://mcanalytics.org`, and that address cannot be
+changed in configuration. It only runs a downloaded bundle whose SHA-256 and byte size match the release
 manifest.

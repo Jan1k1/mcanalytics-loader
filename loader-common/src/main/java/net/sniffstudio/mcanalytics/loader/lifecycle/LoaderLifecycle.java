@@ -7,6 +7,7 @@ import net.sniffstudio.mcanalytics.loader.api.LoaderLogger;
 import net.sniffstudio.mcanalytics.loader.api.PlatformHandle;
 import net.sniffstudio.mcanalytics.loader.config.ConfigManager;
 import net.sniffstudio.mcanalytics.loader.config.LoaderCredentials;
+import net.sniffstudio.mcanalytics.loader.net.ConnectionProblem;
 import net.sniffstudio.mcanalytics.loader.net.ReleaseClient;
 import net.sniffstudio.mcanalytics.loader.util.VersionUtil;
 
@@ -14,6 +15,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Clock;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -32,11 +35,19 @@ public final class LoaderLifecycle {
         FAILED
     }
 
+    /** How often the loader tries again when it has no connector and cannot reach the site. */
+    static final Duration OFFLINE_RETRY_INTERVAL = Duration.ofMinutes(2);
+    /** How often a still failing retry repeats its short reminder. */
+    static final Duration OFFLINE_REMINDER_INTERVAL = Duration.ofMinutes(30);
+
     private final PlatformHandle handle;
     private final ConfigManager configManager;
     private final ReleaseClient releaseClient;
     private final BundleManager bundleManager;
     private final LoaderLogger logger;
+    /** Set only by tests. Null means the locked public address. */
+    private final String endpointOverride;
+    private final Clock clock;
 
     private final ScheduledExecutorService recheckScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "mcanalytics-loader-recheck");
@@ -44,17 +55,34 @@ public final class LoaderLifecycle {
         return t;
     });
     private ScheduledFuture<?> pausedRecheckTask;
+    private ScheduledFuture<?> offlineRetryTask;
+    /** Clock millis of the last offline line, or -1 while the site is reachable. */
+    private volatile long lastOfflineNoticeMillis = -1;
 
     private final AtomicReference<State> state = new AtomicReference<>(State.UNPAIRED);
     private volatile ConnectorClassLoader classLoader;
     private volatile ConnectorEntrypoint entrypoint;
 
     public LoaderLifecycle(PlatformHandle handle) {
+        this(handle, null, Clock.systemUTC());
+    }
+
+    /**
+     * For tests only: talks to {@code endpointOverride} instead of the public address. Operators
+     * have no way to reach this constructor.
+     */
+    LoaderLifecycle(PlatformHandle handle, String endpointOverride, Clock clock) {
         this.handle = handle;
         this.logger = handle.logger();
         this.configManager = new ConfigManager(handle.dataDirectory(), handle.logger());
         this.releaseClient = new ReleaseClient(handle.loaderVersion(), handle.platform());
         this.bundleManager = new BundleManager(handle.dataDirectory());
+        this.endpointOverride = endpointOverride;
+        this.clock = clock != null ? clock : Clock.systemUTC();
+    }
+
+    private String apiUrl() {
+        return endpointOverride != null ? endpointOverride : configManager.resolveApiUrl();
     }
 
     public State getState() {
@@ -62,6 +90,7 @@ public final class LoaderLifecycle {
     }
 
     public void onEnable() {
+        configManager.logIgnoredAddressSettingOnce();
         Optional<LoaderCredentials> credentials = configManager.readCredentials();
         if (credentials.isEmpty() || !credentials.get().isComplete()) {
             state.set(State.UNPAIRED);
@@ -74,6 +103,7 @@ public final class LoaderLifecycle {
 
     public void onDisable() {
         cancelPausedRecheck();
+        cancelOfflineRetry();
         recheckScheduler.shutdownNow();
         stopRunningBundle();
         state.set(State.UNPAIRED);
@@ -124,10 +154,83 @@ public final class LoaderLifecycle {
         }
     }
 
+    /**
+     * Tries the release check again while the loader has no connector to run because the site
+     * could not be reached. Stops on its own once a connector is running.
+     */
+    private synchronized void scheduleOfflineRetry(LoaderCredentials credentials) {
+        if (offlineRetryTask != null && !offlineRetryTask.isDone()) {
+            return;
+        }
+        long minutes = OFFLINE_RETRY_INTERVAL.toMinutes();
+        try {
+            offlineRetryTask = recheckScheduler.scheduleWithFixedDelay(() -> {
+                if (state.get() == State.FAILED) {
+                    handle.asyncExecutor().execute(() -> runReleaseCheckAndLoad(credentials));
+                }
+            }, minutes, minutes, TimeUnit.MINUTES);
+        } catch (RejectedExecutionException ignored) {
+        }
+    }
+
+    private synchronized void cancelOfflineRetry() {
+        if (offlineRetryTask != null) {
+            offlineRetryTask.cancel(false);
+            offlineRetryTask = null;
+        }
+    }
+
+    synchronized boolean isOfflineRetryScheduled() {
+        return offlineRetryTask != null && !offlineRetryTask.isDone();
+    }
+
+    /**
+     * One calm line for a failed update check. The first one of an outage is a warning when there
+     * is no connector to fall back on; while the outage lasts, a short reminder at most every
+     * {@link #OFFLINE_REMINDER_INTERVAL}.
+     */
+    private void noteSiteUnreachable(String reason, Path cachedBundle) {
+        long now = clock.millis();
+        long last = lastOfflineNoticeMillis;
+        boolean firstNotice = last < 0;
+
+        String cannotReach = "[MCAnalytics] Cannot reach " + ConnectionProblem.PUBLIC_HOST + " right now (" + reason + "). ";
+        if (cachedBundle != null) {
+            // Said every time: it explains which connector is starting, and this happens once per
+            // start or /mca update, never in a loop.
+            lastOfflineNoticeMillis = now;
+            logger.info(cannotReach + "Starting the connector already saved on this server ("
+                    + cachedBundle.getFileName() + "). Updates are checked again at the next restart.");
+            return;
+        }
+        if (!firstNotice && now - last < OFFLINE_REMINDER_INTERVAL.toMillis()) {
+            return;
+        }
+        lastOfflineNoticeMillis = now;
+        if (firstNotice) {
+            logger.warn(cannotReach + "Your server is fine. Analytics starts as soon as the connector can be "
+                    + "downloaded, and the loader tries again every " + OFFLINE_RETRY_INTERVAL.toMinutes()
+                    + " minutes. If this lasts more than 30 minutes, open a ticket in our Discord: "
+                    + ConnectionProblem.DISCORD_URL);
+        } else {
+            logger.warn("[MCAnalytics] Still cannot reach " + ConnectionProblem.PUBLIC_HOST + " (" + reason
+                    + "). Trying again every " + OFFLINE_RETRY_INTERVAL.toMinutes() + " minutes. Discord: "
+                    + ConnectionProblem.DISCORD_URL);
+        }
+    }
+
+    /** Says the site is back, but only when an offline line was printed first. */
+    private void noteSiteReachable() {
+        if (lastOfflineNoticeMillis >= 0) {
+            lastOfflineNoticeMillis = -1;
+            logger.info("[MCAnalytics] Connection to " + ConnectionProblem.PUBLIC_HOST + " is back.");
+        }
+    }
+
     public void runReleaseCheckAndLoad(LoaderCredentials credentials) {
         state.set(State.CHECKING);
         try {
-            String apiUrl = configManager.resolveApiUrl();
+            String apiUrl = apiUrl();
             String dashboardUrl = configManager.resolveDashboardUrl(apiUrl);
 
             ReleaseClient.ReleaseCheckResult checkResult = releaseClient.checkRelease(
@@ -137,6 +240,8 @@ public final class LoaderLifecycle {
             );
 
             if (checkResult.statusCode() == 402) {
+                noteSiteReachable();
+                cancelOfflineRetry();
                 logger.info("[MCAnalytics] Network has no active plan. Analytics is paused. Pick a plan at " + dashboardUrl + ".");
                 state.set(State.PAUSED_NO_PLAN);
                 schedulePausedRecheck(credentials);
@@ -146,13 +251,18 @@ public final class LoaderLifecycle {
             cancelPausedRecheck();
 
             if (checkResult.statusCode() == 401) {
-                logger.info("[MCAnalytics] Connector token was revoked. Run /mca pair <code> to re-pair.");
+                noteSiteReachable();
+                cancelOfflineRetry();
+                logger.info("[MCAnalytics] Connector token was revoked, so this server is no longer paired. "
+                        + "Run /mca pair <code> to pair it again.");
                 configManager.clearCredentials();
                 state.set(State.UNPAIRED);
                 return;
             }
 
             Path bundleToLoad = null;
+            // Plain words for why no fresh bundle is available, when the reason is the connection.
+            String unreachableReason = null;
 
             if (checkResult.statusCode() == 200 && checkResult.metadata() != null) {
                 ReleaseClient.ReleaseMetadata meta = checkResult.metadata();
@@ -166,6 +276,7 @@ public final class LoaderLifecycle {
                 try {
                     Path targetPath = bundleManager.getBundlePath(handle.platform(), meta.version());
                     if (bundleManager.isBundleValid(targetPath, meta.sha256())) {
+                        noteSiteReachable();
                         logger.info("[MCAnalytics] Using cached connector bundle v" + meta.version() + ".");
                         bundleToLoad = targetPath;
                     } else {
@@ -175,29 +286,67 @@ public final class LoaderLifecycle {
                             logger.info("[MCAnalytics] Downloading connector bundle v" + meta.version() + "...");
                             releaseClient.downloadBundle(downloadUrl, credentials.connectorToken(), tempFile, meta.sha256(), meta.sizeBytes());
                             Files.move(tempFile, targetPath, StandardCopyOption.REPLACE_EXISTING);
+                            noteSiteReachable();
                             logger.info("[MCAnalytics] Verified and installed connector bundle v" + meta.version() + ".");
                             bundleToLoad = targetPath;
+                        } catch (ReleaseClient.DownloadStatusException e) {
+                            Files.deleteIfExists(tempFile);
+                            unreachableReason = ConnectionProblem.describeStatus(e.statusCode());
+                        } catch (IOException e) {
+                            Files.deleteIfExists(tempFile);
+                            if (isIntegrityFailure(e)) {
+                                // Not a connection problem: the bytes did not match the manifest.
+                                logger.warn("[MCAnalytics] Failed to download release: " + e.getMessage());
+                            } else {
+                                unreachableReason = ConnectionProblem.describe(e);
+                            }
                         } catch (Exception e) {
                             Files.deleteIfExists(tempFile);
-                            logger.warn("[MCAnalytics] Failed to download release: " + e.getMessage());
+                            if (e instanceof InterruptedException) {
+                                Thread.currentThread().interrupt();
+                            }
+                            unreachableReason = ConnectionProblem.describe(e);
                         }
                     }
                 } catch (Exception e) {
                     logger.warn("[MCAnalytics] Error processing connector release: " + e.getMessage());
                 }
+            } else if (checkResult.statusCode() == 0 || ConnectionProblem.isConnectionStatus(checkResult.statusCode())) {
+                unreachableReason = checkResult.statusCode() > 0
+                        ? ConnectionProblem.describeStatus(checkResult.statusCode())
+                        : (checkResult.errorMessage() != null ? checkResult.errorMessage() : "connection failed");
+            } else {
+                logger.warn("[MCAnalytics] Release check failed: "
+                        + (checkResult.errorMessage() != null ? checkResult.errorMessage() : "HTTP " + checkResult.statusCode()));
             }
 
             if (bundleToLoad == null) {
                 Optional<Path> cached = bundleManager.findNewestValidCachedBundle(handle.platform());
+                if (unreachableReason != null) {
+                    noteSiteUnreachable(unreachableReason, cached.orElse(null));
+                }
                 if (cached.isPresent()) {
-                    logger.warn("[MCAnalytics] Using cached fallback bundle: " + cached.get().getFileName());
+                    if (unreachableReason == null) {
+                        logger.info("[MCAnalytics] Starting the connector already saved on this server ("
+                                + cached.get().getFileName() + ").");
+                    }
                     bundleToLoad = cached.get();
                 } else {
-                    logger.error("[MCAnalytics] No valid connector bundle available. Analytics is offline.");
                     state.set(State.FAILED);
+                    if (unreachableReason != null) {
+                        scheduleOfflineRetry(credentials);
+                    } else {
+                        // Not a connection problem, so trying again on a timer would only repeat it.
+                        cancelOfflineRetry();
+                        logger.warn("[MCAnalytics] No verified connector is available, so analytics is off. "
+                                + "Run /mca update to try again. If this keeps happening, open a ticket in our Discord: "
+                                + ConnectionProblem.DISCORD_URL);
+                    }
                     return;
                 }
             }
+
+            cancelOfflineRetry();
 
             try {
                 ClassLoader parentClassLoader = handle.getClass().getClassLoader();
@@ -221,6 +370,11 @@ public final class LoaderLifecycle {
         }
     }
 
+    private static boolean isIntegrityFailure(IOException e) {
+        String message = e.getMessage();
+        return message != null && (message.startsWith("Checksum mismatch") || message.startsWith("Downloaded file size mismatch"));
+    }
+
     public boolean handleCommand(CommandSender sender, String[] args) {
         if (args != null && args.length >= 2 && args[0].equalsIgnoreCase("pair")) {
             if (!sender.isConsole() && !sender.hasPermission("mcanalytics.admin")) {
@@ -232,7 +386,7 @@ public final class LoaderLifecycle {
             sender.sendMessage("[MCAnalytics] Pairing with code " + code + "...");
 
             handle.asyncExecutor().execute(() -> {
-                String apiUrl = configManager.resolveApiUrl();
+                String apiUrl = apiUrl();
                 ReleaseClient.PairResult result = releaseClient.pair(apiUrl, code, handle.platform());
 
                 if (result.success() && result.credentials() != null) {
@@ -288,7 +442,7 @@ public final class LoaderLifecycle {
         }
 
         if (state.get() == State.PAUSED_NO_PLAN) {
-            String apiUrl = configManager.resolveApiUrl();
+            String apiUrl = apiUrl();
             String dashboardUrl = configManager.resolveDashboardUrl(apiUrl);
             sender.sendMessage("[MCAnalytics] Network has no active plan. Analytics is paused. Pick a plan at " + dashboardUrl + ".");
             return true;
@@ -304,7 +458,7 @@ public final class LoaderLifecycle {
     }
 
     private void sendStatus(CommandSender sender) {
-        String apiUrl = configManager.resolveApiUrl();
+        String apiUrl = apiUrl();
         Optional<LoaderCredentials> stored = configManager.readCredentials();
 
         sender.sendMessage("[MCAnalytics] Loader " + handle.loaderVersion() + " on " + handle.platform() + ".");
