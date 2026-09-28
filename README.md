@@ -14,16 +14,17 @@ MCAnalytics software and is not part of this repository. See [Security notes](#s
    `mcanalytics-loader-paper-<version>.jar` (Paper or Folia server) from the
    [Releases](https://github.com/Jan1k1/mcanalytics-loader/releases) page.
 2. Drop the jar in your `plugins` folder and start the server. The console prints
-   `Server is not paired. Run '/mca pair <code>' in console to connect.`
+   `Server is not paired. Run 'mca pair <code>' in the console to connect.`
 3. Open the setup page in the MCAnalytics dashboard, copy the pairing code, and run
-   `/mca pair <code>` in the server console. The loader saves the credential, downloads the
-   connector, and starts it.
+   `mca pair <code>` in the server console, without a slash (the Velocity console does not
+   accept one). The loader saves the credential, downloads the connector, and starts it.
 
 The Velocity jar goes on the proxy. The Paper jar goes on each backend server you want to measure.
 
 ## Commands
 
-All three commands need console access or the `mcanalytics.admin` permission.
+All three commands need console access or the `mcanalytics.admin` permission. In game they
+start with a slash, as below; in a console type them without it, such as `mca pair <code>`.
 
 | Command | What it does |
 | --- | --- |
@@ -37,7 +38,7 @@ The loader can be in one of five states, which `/mca status` reports:
 
 | State | Meaning |
 | --- | --- |
-| `UNPAIRED` | No credential on disk. Run `/mca pair <code>`. |
+| `UNPAIRED` | No credential on disk. Run `mca pair <code>` in the console. |
 | `CHECKING` | Talking to the release API, or starting the connector. |
 | `PAUSED_NO_PLAN` | The network has no active plan. The loader re-checks every 30 minutes. |
 | `ACTIVE` | The connector is running. |
