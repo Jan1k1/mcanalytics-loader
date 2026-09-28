@@ -547,9 +547,34 @@ class LoaderLifecycleTest {
                 .filteredOn(msg -> msg.contains("Server is not paired"))
                 .hasSize(1);
 
+        // The Velocity console refuses a leading slash, so the console hint has none.
+        assertThat(loggedMessages).anyMatch(msg -> msg.contains("Run 'mca pair <code>' in the console"));
+        assertThat(loggedMessages).noneMatch(msg -> msg.contains("/mca pair"));
+
         TestSender sender = new TestSender();
         assertThat(lifecycle.handleCommand(sender, new String[0])).isTrue();
-        assertThat(sender.messages).anyMatch(msg -> msg.contains("/mca pair <code>"));
+        assertThat(sender.messages).anyMatch(msg -> msg.contains("Run 'mca pair <code>' to connect"));
+        assertThat(sender.messages).noneMatch(msg -> msg.contains("/mca pair"));
+
+        // In chat the command keeps its slash.
+        List<String> chat = new ArrayList<>();
+        lifecycle.handleCommand(new CommandSender() {
+            @Override
+            public void sendMessage(String message) {
+                chat.add(message);
+            }
+
+            @Override
+            public boolean hasPermission(String permission) {
+                return true;
+            }
+
+            @Override
+            public boolean isConsole() {
+                return false;
+            }
+        }, new String[]{"status"});
+        assertThat(chat).anyMatch(msg -> msg.contains("Run '/mca pair <code>' to connect"));
     }
 
     @Test

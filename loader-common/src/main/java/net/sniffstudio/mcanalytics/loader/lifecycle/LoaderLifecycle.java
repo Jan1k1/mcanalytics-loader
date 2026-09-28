@@ -94,7 +94,7 @@ public final class LoaderLifecycle {
         Optional<LoaderCredentials> credentials = configManager.readCredentials();
         if (credentials.isEmpty() || !credentials.get().isComplete()) {
             state.set(State.UNPAIRED);
-            logger.info("[MCAnalytics] Server is not paired. Run '/mca pair <code>' in console to connect.");
+            logger.info("[MCAnalytics] Server is not paired. Run '" + CONSOLE_PAIR_COMMAND + "' in the console to connect.");
             return;
         }
 
@@ -254,7 +254,7 @@ public final class LoaderLifecycle {
                 noteSiteReachable();
                 cancelOfflineRetry();
                 logger.info("[MCAnalytics] Connector token was revoked, so this server is no longer paired. "
-                        + "Run /mca pair <code> to pair it again.");
+                        + "Run '" + CONSOLE_PAIR_COMMAND + "' in the console to pair it again.");
                 configManager.clearCredentials();
                 state.set(State.UNPAIRED);
                 return;
@@ -375,6 +375,17 @@ public final class LoaderLifecycle {
         return message != null && (message.startsWith("Checksum mismatch") || message.startsWith("Downloaded file size mismatch"));
     }
 
+    /**
+     * The pair command as typed in a server console. The Velocity console does not take a leading
+     * slash, and the bare command works in every console, so this is the form a log line names.
+     */
+    static final String CONSOLE_PAIR_COMMAND = "mca pair <code>";
+
+    /** The pair command as the sender types it: bare in a console, with a slash in chat. */
+    static String pairCommand(CommandSender sender) {
+        return sender == null || sender.isConsole() ? CONSOLE_PAIR_COMMAND : "/" + CONSOLE_PAIR_COMMAND;
+    }
+
     public boolean handleCommand(CommandSender sender, String[] args) {
         if (args != null && args.length >= 2 && args[0].equalsIgnoreCase("pair")) {
             if (!sender.isConsole() && !sender.hasPermission("mcanalytics.admin")) {
@@ -419,7 +430,7 @@ public final class LoaderLifecycle {
 
             Optional<LoaderCredentials> stored = configManager.readCredentials();
             if (stored.isEmpty()) {
-                sender.sendMessage("[MCAnalytics] Server is not paired. Run '/mca pair <code>' in console to connect.");
+                sender.sendMessage("[MCAnalytics] Server is not paired. Run '" + pairCommand(sender) + "' to connect.");
                 return true;
             }
 
@@ -437,7 +448,7 @@ public final class LoaderLifecycle {
         }
 
         if (state.get() == State.UNPAIRED) {
-            sender.sendMessage("[MCAnalytics] Server is not paired. Run '/mca pair <code>' in console to connect.");
+            sender.sendMessage("[MCAnalytics] Server is not paired. Run '" + pairCommand(sender) + "' to connect.");
             return true;
         }
 
@@ -453,7 +464,7 @@ public final class LoaderLifecycle {
             return true;
         }
 
-        sender.sendMessage("[MCAnalytics] Connector is not active. Run '/mca pair <code>' to pair.");
+        sender.sendMessage("[MCAnalytics] Connector is not active. Run '" + pairCommand(sender) + "' to pair.");
         return true;
     }
 
@@ -470,7 +481,7 @@ public final class LoaderLifecycle {
             String serverName = creds.serverName() != null && !creds.serverName().isBlank() ? creds.serverName() : creds.serverId();
             sender.sendMessage("[MCAnalytics] Paired as " + serverName + " (network " + creds.networkId() + ").");
         } else {
-            sender.sendMessage("[MCAnalytics] Not paired. Run '/mca pair <code>' in console to connect.");
+            sender.sendMessage("[MCAnalytics] Not paired. Run '" + pairCommand(sender) + "' to connect.");
         }
 
         sender.sendMessage("[MCAnalytics] Bundle: " + loadedBundleName() + ".");
