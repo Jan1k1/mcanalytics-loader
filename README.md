@@ -185,8 +185,9 @@ holds its own jar.
   file instead of adding one, so exactly one loader jar exists at every moment. A pending jar
   that fails a check, has no record, or is no longer newer is deleted. If the rename fails, for
   example because the operating system keeps the jar locked, the pending file stays and the console
-  says so; delete nothing and try the next restart, or move the `.pending` file over the jar by
-  hand while the proxy is stopped.
+  says so. The pending file stays, the old loader keeps running, and the swap is tried again at
+  the next start; you can also move the `.pending` file over the jar by hand while the proxy is
+  stopped.
 
 When a jar is staged the console prints one line:
 `MCAnalytics loader X.Y.Z is ready and will be used after the next restart.`
