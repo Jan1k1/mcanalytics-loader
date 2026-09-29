@@ -40,4 +40,24 @@ class VersionUtilTest {
             assertThat(VersionUtil.isStrictVersion(bad)).as("version %s", bad).isFalse();
         }
     }
+
+    @Test
+    void isNewerComparesNumbersNotText() {
+        assertThat(VersionUtil.isNewer("1.0.4", "1.0.5")).isTrue();
+        assertThat(VersionUtil.isNewer("1.0.9", "1.0.10")).isTrue();
+        assertThat(VersionUtil.isNewer("1.9.9", "1.10.0")).isTrue();
+        assertThat(VersionUtil.isNewer("1.0.5", "2.0.0")).isTrue();
+        assertThat(VersionUtil.isNewer("1.0.4-SNAPSHOT", "1.0.5")).isTrue();
+    }
+
+    @Test
+    void isNewerRefusesSameOlderAndMalformed() {
+        assertThat(VersionUtil.isNewer("1.0.5", "1.0.5")).isFalse();
+        assertThat(VersionUtil.isNewer("1.0.5", "1.0.4")).isFalse();
+        assertThat(VersionUtil.isNewer("1.10.0", "1.9.9")).isFalse();
+        assertThat(VersionUtil.isNewer("1.0.5", null)).isFalse();
+        assertThat(VersionUtil.isNewer("1.0.5", "1.0.6-beta")).isFalse();
+        assertThat(VersionUtil.isNewer("1.0.5", "../1.0.6")).isFalse();
+        assertThat(VersionUtil.isNewer("1.0.5", "9.9.9.9")).isFalse();
+    }
 }

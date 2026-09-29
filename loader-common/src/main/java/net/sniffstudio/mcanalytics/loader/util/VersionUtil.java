@@ -17,6 +17,15 @@ public final class VersionUtil {
         return version != null && STRICT_VERSION.matcher(version).matches();
     }
 
+    /**
+     * True only when {@code candidate} is a strict {@code x.y.z} version that is higher than
+     * {@code current}. Equal, lower and malformed candidates are all false, so a loader can
+     * never be moved back to an older jar.
+     */
+    public static boolean isNewer(String current, String candidate) {
+        return isStrictVersion(candidate) && compare(current, candidate) < 0;
+    }
+
     public static int compare(String v1, String v2) {
         if (v1 == null && v2 == null) {
             return 0;
