@@ -2,7 +2,7 @@
 
 A small open source plugin for Velocity proxies and Paper servers. It pairs your server with an
 MCAnalytics network, downloads the MCAnalytics connector, checks the download against the checksum
-the server published, and runs it. After that it keeps the connector up to date, so you never have
+and the Ed25519 signature the server published, and runs it. After that it keeps the connector up to date, so you never have
 to replace a jar by hand again.
 
 The loader in this repository is MIT licensed. The connector bundle it downloads is proprietary
@@ -30,7 +30,7 @@ start with a slash, as below; in a console type them without it, such as `mca pa
 | --- | --- |
 | `/mca pair <code>` | Trades a pairing code from the dashboard for a connector credential, saves it, then downloads and starts the connector. |
 | `/mca status` | Prints the loader version, the current state, the address it talks to, the paired server and network, and the loaded bundle. It never prints the token. |
-| `/mca update` | Checks the release API again, downloads a newer connector if there is one, and restarts it. |
+| `/mca update` | Checks the release API again and, if it finds a verified connector, restarts the connector on it. The running connector is only stopped once that verified replacement is ready. If a check or update is already running, the second request is ignored with a message. |
 
 `/mcanalytics` is an alias for `/mca`. Any other subcommand is passed to the running connector.
 
@@ -42,7 +42,7 @@ The loader can be in one of five states, which `/mca status` reports:
 | `CHECKING` | Talking to the release API, or starting the connector. |
 | `PAUSED_NO_PLAN` | The network has no active plan. The loader re-checks every 30 minutes. |
 | `ACTIVE` | The connector is running. |
-| `FAILED` | No usable connector bundle. The console log says why. When the cause is that mcanalytics.org cannot be reached, the loader tries again every 2 minutes on its own. |
+| `FAILED` | No usable connector bundle. The console log says why. When the cause is that mcanalytics.org cannot be reached, the loader tries again every 2 minutes on its own. For any other cause, such as a release that failed verification, it tries again every 30 minutes. |
 
 ## Configuration
 
@@ -67,56 +67,99 @@ Files the loader writes inside its own data folder:
 
 | File | Contents |
 | --- | --- |
-| `credential.json` | The connector token and the network and server ids. Written with mode 600 where the filesystem supports POSIX permissions. |
-| `cache/connector-<platform>-<version>.jar` | Verified connector bundles. |
+| `credential.json` | The connector token and the network and server ids. Created owner-only from the first byte (mode 600 on POSIX, an owner-only ACL on Windows). |
+| `cache/connector-<platform>-<version>.jar` | Connector bundles that passed the checksum and signature checks. |
+| `cache/connector-<platform>-<version>.jar.verify.json` | The sha256 and signature the bundle was installed with. The loader checks the jar against it again before every load. |
 
 ## How updates work
 
 On every start, and on every `/mca update`, the loader asks
-`GET /api/v1/connector/release?platform=<platform>` with its connector token. The reply is a
-manifest with the bundle `version`, its `sha256`, its `sizeBytes`, a `downloadPath`, and the
-`minLoader` version the bundle needs.
+`GET /api/v1/connector/release?platform=<platform>` with its connector token. The reply must be a
+JSON object with a `data` object that carries these fields, and the loader refuses the reply if
+any required field is missing or malformed:
 
-- If the cached bundle for that version already matches the checksum, the loader uses it and
-  downloads nothing.
-- Otherwise it downloads the bundle to a temporary file, hashes it while it streams, and compares
-  the size and the SHA-256 against the manifest. A mismatch deletes the temporary file and the
-  bundle is never installed or run.
-- Only a verified file is moved into the cache and loaded.
-- If the API cannot be reached, the loader falls back to the newest bundle already in its cache, so
-  a network outage does not take your analytics down. The console gets one calm line that says so,
-  for example `Cannot reach mcanalytics.org right now (HTTP 502). Starting the connector already
-  saved on this server (connector-paper-1.0.10.jar).` Only the HTTP status or a short cause (`timed
-  out`, `address lookup failed`, `connection failed`) is shown, never a raw error page.
-- If the API cannot be reached and nothing is cached yet, the loader prints one warning, tries again
-  every 2 minutes, and repeats a short reminder at most every 30 minutes until the connection is
-  back. If that lasts more than 30 minutes, open a ticket in our Discord:
+| Field | Required | Rule |
+| --- | --- | --- |
+| `version` | yes | Three numbers of one to four digits, `x.y.z`. Nothing else is accepted, because it becomes part of a file name. |
+| `sha256` | yes | 64 hexadecimal characters, the SHA-256 of the jar. |
+| `sizeBytes` | yes | The exact size of the jar in bytes. Above zero and at most 64 MB. |
+| `signature` | yes | Base64 of the 64 byte Ed25519 signature over the raw bytes of the jar. |
+| `downloadPath` | yes | A path on mcanalytics.org that starts with exactly one `/`. |
+| `minLoader` | no | The lowest loader version the bundle needs. Defaults to `1.0.0`. |
+
+- The reply is read up to 64 KB and nested no deeper than 32 levels. Larger or deeper replies are
+  refused.
+- The download address is the API address plus `downloadPath`. A path that would change the host,
+  such as `@other.example/x` or `//other.example/x`, is refused before any request is sent. A
+  redirect is followed only when it stays on the same scheme, host and port; a redirect to another
+  host is refused, so the token is never sent anywhere else.
+- If the cached jar for that version matches the manifest's size, sha256 and signature, the loader
+  uses it and downloads nothing.
+- Otherwise it downloads the jar to a temporary file. It stops reading at the declared size, never
+  more than 64 MB, and checks the size, the SHA-256 and then the signature. A jar that fails any of
+  them is deleted and never installed or run.
+- Only a verified file is moved into the cache, and its sha256 and signature are saved next to it.
+- Before every start, including a fallback to an older jar, the loader hashes the jar on disk again
+  and verifies the saved signature against the trusted keys. A cached jar that was changed after
+  install, has no record, or fails the signature is skipped and named in the log.
+- If the API cannot be reached, or its reply is refused, the loader falls back to the newest cached
+  jar that still verifies, so a network outage does not take your analytics down. The console gets
+  one calm line that says so, for example `Cannot reach mcanalytics.org right now (HTTP 502).
+  Starting the connector already saved on this server (connector-paper-1.0.10.jar).` Only the HTTP
+  status or a short cause (`timed out`, `address lookup failed`, `connection failed`) is shown,
+  never a raw error page. The loader does not compare cached versions against a server-side minimum,
+  so this fallback can be an older release than the newest one.
+- If a connector is already running and a check fails for any reason, it keeps running and the check
+  is repeated later (every 2 minutes after a connection failure, every 30 minutes otherwise).
+- If the API cannot be reached and nothing verified is cached, the loader prints one warning, tries
+  again every 2 minutes, and repeats a short reminder at most every 30 minutes until the connection
+  is back. If that lasts more than 30 minutes, open a ticket in our Discord:
   https://discord.gg/9MWENuGmYn
 - If the loader is older than `minLoader`, it logs a warning telling you to download a newer loader,
   and still tries to run the bundle.
-- HTTP 402 means the network has no active plan. The loader pauses and re-checks every 30 minutes.
-- HTTP 401 means the token was revoked. The loader clears the credential and asks you to pair again.
+- HTTP 402 means the network has no active plan. The loader stops the connector, pauses, and
+  re-checks every 30 minutes.
+- HTTP 401 means the token was revoked. The loader deletes the credential and asks you to pair again.
 
 ## Security notes
 
 What the loader downloads: one jar, the MCAnalytics connector for your platform, from
 `https://mcanalytics.org`. Nothing else.
 
-How it checks the download: the release manifest carries a SHA-256 and a byte size. The loader
-verifies both before the file is moved into place. A bundle that fails either check is deleted and
-never loaded.
+How it checks the download: the release manifest carries a SHA-256, a byte size and an Ed25519
+signature over the jar. The loader verifies all three before the file is moved into place, and
+verifies the checksum and signature again before every load of a cached jar. The signature is
+checked with the JDK's built-in Ed25519 against public keys compiled into the loader (currently
+one, in `BundleVerifier.TRUSTED_PUBLIC_KEYS_BASE64`; the list exists so the key can be rotated).
+This means a checksum alone is not enough: someone who controls the download server but not the
+signing key cannot get a jar of their own accepted. A jar that fails a check is deleted or skipped
+and never loaded.
 
-Where it runs the bundle: in a separate `URLClassLoader` with the loader as parent, so the connector
-is isolated from the rest of your plugins and can be stopped and replaced without a server restart.
+Where it runs the bundle: in a separate `URLClassLoader` with the loader as parent. That separates
+class names and lets the connector be stopped and replaced without a server restart. It is not a
+sandbox. The connector runs inside your server's JVM with the same permissions as every other
+plugin, and can read files, open connections and call the server API. The protection is that only
+jars signed with the MCAnalytics key are ever loaded, not any restriction on what a loaded jar can do.
 
 What the loader never does:
 
-- It never prints the connector token, in a log line or in a command reply.
-- It never talks to any address but `https://mcanalytics.org`, whatever a config file or the
-  environment says.
-- It never runs a bundle whose checksum does not match the manifest.
+- It never prints the connector token, in a log line or in a command reply. Errors from reading
+  JSON never repeat the text that was being read.
+- It never sends the token to any host but the one it is configured for, `https://mcanalytics.org`.
+  Download paths are checked to stay on that host and redirects to another host are refused.
+- It never talks to any other address, whatever a config file or the environment says. The one
+  exception is an internal switch used by the test suite that accepts only `localhost`,
+  `127.0.0.1` and `::1`.
+- It never runs a bundle whose checksum or signature does not verify.
+- It never keeps a revoked token: the credential file is deleted, not renamed.
 - It never reads or writes outside its own plugin data folder.
 - It never contacts the release API before the server is paired.
+
+Limits of these checks: the signature proves a jar was signed by a trusted key, not that it is the
+newest one, so a validly signed older jar in the cache can still be started when the site is
+unreachable. Anyone who can already write to your plugins folder can replace the loader itself,
+which no check inside the loader can prevent. If the signing key were stolen, jars signed with it
+would be trusted until a loader release removes that key.
 
 The connector bundle itself is closed source MCAnalytics software under its own licence. The loader
 being MIT means you can read and audit everything that decides what gets downloaded and run. It does
@@ -141,13 +184,14 @@ loader-velocity/build/libs/mcanalytics-loader-velocity-<version>.jar
 loader-paper/build/libs/mcanalytics-loader-paper-<version>.jar
 ```
 
-`./gradlew test` runs the tests on their own.
+`./gradlew test` runs the tests on their own. The Gradle wrapper checks the Gradle download against a
+pinned SHA-256 (`distributionSha256Sum` in `gradle/wrapper/gradle-wrapper.properties`).
 
 Modules:
 
 | Module | Contents |
 | --- | --- |
-| `loader-common` | Config and credential handling, the release client, checksum verification, the bundle cache, the isolated classloader, and the lifecycle and command logic. No platform code. |
+| `loader-common` | Config and credential handling, the release client, checksum and signature verification, the bundle cache, the isolated classloader, and the lifecycle and command logic. No platform code. |
 | `loader-velocity` | The Velocity plugin entry point and command bridge. |
 | `loader-paper` | The Paper and Folia plugin entry point and command bridge. |
 
