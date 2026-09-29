@@ -1,8 +1,21 @@
 package net.sniffstudio.mcanalytics.loader.util;
 
+import java.util.regex.Pattern;
+
 public final class VersionUtil {
 
+    /**
+     * The only shape of version the loader lets into a file name: three numbers of one to four
+     * digits. Anything else, such as a path, a suffix or a newline, is refused.
+     */
+    private static final Pattern STRICT_VERSION = Pattern.compile("[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,4}");
+
     private VersionUtil() {}
+
+    /** True for {@code ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$} and nothing else. */
+    public static boolean isStrictVersion(String version) {
+        return version != null && STRICT_VERSION.matcher(version).matches();
+    }
 
     public static int compare(String v1, String v2) {
         if (v1 == null && v2 == null) {

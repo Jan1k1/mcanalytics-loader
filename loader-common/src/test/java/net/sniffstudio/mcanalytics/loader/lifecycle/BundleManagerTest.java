@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BundleManagerTest {
 
@@ -54,5 +55,33 @@ class BundleManagerTest {
     @DisplayName("An empty cache reports no bundle")
     void emptyCacheHasNoBundle(@TempDir Path tempDir) {
         assertThat(new BundleManager(tempDir).findNewestValidCachedBundle("paper")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("A version that is not three plain numbers never becomes a file name")
+    void refusesBadVersionStrings(@TempDir Path tempDir) {
+        BundleManager manager = new BundleManager(tempDir);
+
+        for (String bad : new String[]{"../../evil", "1.2.3/../../evil", "1.2.3\n", "1.2", "1.2.3-SNAPSHOT",
+                "1.2.3.4", "", "%2e%2e", "..", "12345.0.0", "1.2.3\\..\\x"}) {
+            assertThatThrownBy(() -> manager.getBundlePath("paper", bad))
+                    .as("version %s", bad)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("Invalid connector version");
+        }
+        assertThatThrownBy(() -> manager.getBundlePath("../paper", "1.2.3"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> manager.getBundlePath(null, "1.2.3"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @DisplayName("A good version resolves to a file directly inside the cache folder")
+    void goodVersionStaysInsideTheCache(@TempDir Path tempDir) throws Exception {
+        BundleManager manager = new BundleManager(tempDir);
+        Path path = manager.getBundlePath("velocity", "12.34.56");
+
+        assertThat(path.getParent()).isEqualTo(manager.getCacheDir().toAbsolutePath().normalize());
+        assertThat(path.getFileName()).hasToString("connector-velocity-12.34.56.jar");
     }
 }
