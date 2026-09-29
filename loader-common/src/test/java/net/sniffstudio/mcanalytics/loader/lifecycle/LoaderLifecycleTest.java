@@ -28,7 +28,9 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -982,5 +984,204 @@ class LoaderLifecycleTest {
 
         assertThat(Files.readAllBytes(jar)).isEqualTo(payload);
         assertThat(loggedMessages).anyMatch(msg -> msg.contains("Verified and installed connector bundle v6.0.0"));
+    }
+
+    private static ConnectorEntrypoint recordingEntrypoint(AtomicBoolean stopped) {
+        return new ConnectorEntrypoint() {
+            @Override
+            public void start(PlatformHandle h) {}
+
+            @Override
+            public void stop() {
+                stopped.set(true);
+            }
+        };
+    }
+
+    private static ConnectorClassLoader fakeClassLoader(Path dir, AtomicBoolean closed) throws IOException {
+        Path dummyJar = dir.resolve("dummy.jar");
+        Files.writeString(dummyJar, "dummy");
+        return new ConnectorClassLoader(dummyJar, LoaderLifecycleTest.class.getClassLoader()) {
+            @Override
+            public void close() throws IOException {
+                closed.set(true);
+                super.close();
+            }
+        };
+    }
+
+    @Test
+    void aSecondConcurrentUpdateIsIgnoredWithAMessage(@TempDir Path tempDir) throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch proceed = new CountDownLatch(1);
+        AtomicInteger releaseCalls = new AtomicInteger();
+        server.createContext("/api/v1/connector/release", exchange -> {
+            releaseCalls.incrementAndGet();
+            entered.countDown();
+            try {
+                proceed.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            byte[] response = "{\"error\":{\"code\":\"PLAN_REQUIRED\",\"message\":\"Plan required\"}}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(402, response.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response);
+            }
+        });
+
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        new ConfigManager(tempDir, handle.logger())
+                .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+        LoaderLifecycle lifecycle = localLifecycle(handle);
+
+        TestSender first = new TestSender();
+        Thread firstUpdate = new Thread(() -> lifecycle.handleCommand(first, new String[]{"update"}));
+        firstUpdate.start();
+        try {
+            assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+
+            TestSender second = new TestSender();
+            assertThat(lifecycle.handleCommand(second, new String[]{"update"})).isTrue();
+            assertThat(second.messages).anyMatch(msg -> msg.contains("already in progress"));
+            assertThat(second.messages).noneMatch(msg -> msg.contains("Update check finished"));
+
+            // A scheduled re-check meeting a running update does nothing either.
+            assertThat(lifecycle.runReleaseCheckIfIdle(new LoaderCredentials("mca_live_test", "n", "s", "l", "paper", Instant.now())))
+                    .isFalse();
+            assertThat(releaseCalls.get()).isEqualTo(1);
+        } finally {
+            proceed.countDown();
+            firstUpdate.join(10_000);
+            lifecycle.onDisable();
+        }
+        assertThat(first.messages).anyMatch(msg -> msg.contains("Update check finished"));
+        assertThat(releaseCalls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void checksNeverRunAtTheSameTime(@TempDir Path tempDir) throws Exception {
+        AtomicInteger inFlight = new AtomicInteger();
+        AtomicInteger maxInFlight = new AtomicInteger();
+        server.createContext("/api/v1/connector/release", exchange -> {
+            int now = inFlight.incrementAndGet();
+            maxInFlight.accumulateAndGet(now, Math::max);
+            try {
+                Thread.sleep(150);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            inFlight.decrementAndGet();
+            byte[] response = "{\"error\":{\"code\":\"PLAN_REQUIRED\",\"message\":\"Plan required\"}}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(402, response.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response);
+            }
+        });
+
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        LoaderCredentials credentials = new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now());
+        LoaderLifecycle lifecycle = localLifecycle(handle);
+        try {
+            List<Thread> threads = new ArrayList<>();
+            for (int i = 0; i < 4; i++) {
+                Thread t = new Thread(() -> lifecycle.runReleaseCheckAndLoad(credentials));
+                threads.add(t);
+                t.start();
+            }
+            for (Thread t : threads) {
+                t.join(20_000);
+            }
+        } finally {
+            lifecycle.onDisable();
+        }
+        assertThat(maxInFlight.get()).isEqualTo(1);
+    }
+
+    @Test
+    void aRefusedReplyDuringUpdateLeavesTheRunningConnectorOn(@TempDir Path tempDir) throws Exception {
+        // No checksum, no size, no signature: refused before any download.
+        serveReleaseReplacing("{\"version\":\"9.9.9\",\"downloadPath\":\"/api/v1/connector/release/download\"}");
+
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        new ConfigManager(tempDir, handle.logger())
+                .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+        LoaderLifecycle lifecycle = signedLifecycle(handle);
+
+        AtomicBoolean stopped = new AtomicBoolean();
+        AtomicBoolean closed = new AtomicBoolean();
+        CommandDelegate delegate = (sender, args) -> false;
+        handle.setCommandDelegate(delegate);
+        lifecycle.setActiveBundle(recordingEntrypoint(stopped), fakeClassLoader(tempDir, closed));
+
+        try {
+            TestSender sender = new TestSender();
+            lifecycle.handleCommand(sender, new String[]{"update"});
+
+            assertThat(stopped.get()).isFalse();
+            assertThat(closed.get()).isFalse();
+            assertThat(handle.getCommandDelegate()).isSameAs(delegate);
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.ACTIVE);
+            assertThat(loggedMessages).anyMatch(msg -> msg.contains("The connector that is running stays on"));
+            // And the next scheduled attempt is queued.
+            assertThat(lifecycle.isOfflineRetryScheduled()).isTrue();
+        } finally {
+            lifecycle.onDisable();
+        }
+    }
+
+    @Test
+    void anUnreachableSiteDuringUpdateLeavesTheRunningConnectorOn(@TempDir Path tempDir) throws Exception {
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        new ConfigManager(tempDir, handle.logger())
+                .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+        LoaderLifecycle lifecycle = new LoaderLifecycle(handle, "http://127.0.0.1:1", Clock.systemUTC(), signing.verifier());
+
+        AtomicBoolean stopped = new AtomicBoolean();
+        lifecycle.setActiveBundle(recordingEntrypoint(stopped), fakeClassLoader(tempDir, new AtomicBoolean()));
+        try {
+            lifecycle.handleCommand(new TestSender(), new String[]{"update"});
+
+            assertThat(stopped.get()).isFalse();
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.ACTIVE);
+            assertThat(lifecycle.isOfflineRetryScheduled()).isTrue();
+        } finally {
+            lifecycle.onDisable();
+        }
+    }
+
+    @Test
+    void aBadDownloadDuringUpdateLeavesTheRunningConnectorOn(@TempDir Path tempDir) throws Exception {
+        byte[] payload = "new-jar".getBytes(StandardCharsets.UTF_8);
+        serveBundle(payload, "7.0.0", SigningFixture.sign(SigningFixture.newKeyPair(), payload));
+
+        LoaderLifecycle lifecycle = pairedSignedLifecycle(tempDir);
+        AtomicBoolean stopped = new AtomicBoolean();
+        lifecycle.setActiveBundle(recordingEntrypoint(stopped), fakeClassLoader(tempDir, new AtomicBoolean()));
+        try {
+            lifecycle.handleCommand(new TestSender(), new String[]{"update"});
+
+            assertThat(stopped.get()).isFalse();
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.ACTIVE);
+            assertThat(tempDir.resolve("cache").resolve("connector-paper-7.0.0.jar")).doesNotExist();
+        } finally {
+            lifecycle.onDisable();
+        }
+    }
+
+    @Test
+    void aRefusedReplyWithNoConnectorRetriesInsteadOfStayingOff(@TempDir Path tempDir) throws Exception {
+        serveReleaseReplacing("{\"version\":\"9.9.9\"}");
+
+        LoaderLifecycle lifecycle = pairedSignedLifecycle(tempDir);
+        try {
+            lifecycle.onEnable();
+
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+            assertThat(lifecycle.isOfflineRetryScheduled()).isTrue();
+            assertThat(loggedMessages).anyMatch(msg -> msg.contains("The loader tries again every 30 minutes"));
+        } finally {
+            lifecycle.onDisable();
+        }
     }
 }
