@@ -10,8 +10,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 public final class BundleManager {
+
+    private static final Pattern PLATFORM_NAME = Pattern.compile("[a-z0-9_-]{1,32}");
 
     private final Path cacheDir;
 
@@ -23,9 +26,26 @@ public final class BundleManager {
         return cacheDir;
     }
 
+    /**
+     * The cache path for a connector version. The version comes from the server, so it must be
+     * three plain numbers and the resolved path must stay inside the cache folder.
+     *
+     * @throws IllegalArgumentException when the platform or version is not acceptable
+     */
     public Path getBundlePath(String platform, String version) throws IOException {
+        if (platform == null || !PLATFORM_NAME.matcher(platform).matches()) {
+            throw new IllegalArgumentException("Invalid platform name");
+        }
+        if (!VersionUtil.isStrictVersion(version)) {
+            throw new IllegalArgumentException("Invalid connector version");
+        }
         Files.createDirectories(cacheDir);
-        return cacheDir.resolve("connector-" + platform + "-" + version + ".jar");
+        Path root = cacheDir.toAbsolutePath().normalize();
+        Path resolved = root.resolve("connector-" + platform + "-" + version + ".jar").normalize();
+        if (!resolved.startsWith(root) || !root.equals(resolved.getParent())) {
+            throw new IllegalArgumentException("Connector path escapes the cache folder");
+        }
+        return resolved;
     }
 
     public boolean isBundleValid(Path bundlePath, String expectedSha256) {

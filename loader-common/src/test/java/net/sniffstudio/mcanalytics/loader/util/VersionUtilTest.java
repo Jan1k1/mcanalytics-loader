@@ -28,4 +28,16 @@ class VersionUtilTest {
         assertThat(VersionUtil.compare(currentLoader, requiredMinLoaderEqual)).isEqualTo(0);
         assertThat(VersionUtil.compare(currentLoader, requiredMinLoaderNewer)).isNegative();
     }
+
+    @Test
+    void strictVersionAcceptsOnlyThreeShortNumbers() {
+        assertThat(VersionUtil.isStrictVersion("1.2.3")).isTrue();
+        assertThat(VersionUtil.isStrictVersion("0.0.0")).isTrue();
+        assertThat(VersionUtil.isStrictVersion("1234.5678.9012")).isTrue();
+
+        for (String bad : new String[]{null, "", "1.2", "1.2.3.4", "12345.1.1", "1.2.3-beta", "1.2.3\n", "1.2.3 ",
+                " 1.2.3", "../1.2.3", "1.2.3/../../x", "1.2.\u0663", "a.b.c", "1..3", "1.2.3+build", "..\\..\\1.2.3"}) {
+            assertThat(VersionUtil.isStrictVersion(bad)).as("version %s", bad).isFalse();
+        }
+    }
 }
