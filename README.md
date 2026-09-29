@@ -2,8 +2,9 @@
 
 A small open source plugin for Velocity proxies and Paper servers. It pairs your server with an
 MCAnalytics network, downloads the MCAnalytics connector, checks the download against the checksum
-and the Ed25519 signature the server published, and runs it. After that it keeps the connector up to date, so you never have
-to replace a jar by hand again.
+and the Ed25519 signature the server published, and runs it. After that it keeps the connector up to date, and from
+loader 1.0.5 it updates itself too (see [Loader self-update](#loader-self-update)), so you never have to replace a jar
+by hand again.
 
 The loader in this repository is MIT licensed. The connector bundle it downloads is proprietary
 MCAnalytics software and is not part of this repository. See [Security notes](#security-notes).
@@ -30,7 +31,7 @@ start with a slash, as below; in a console type them without it, such as `mca pa
 | --- | --- |
 | `/mca pair <code>` | Trades a pairing code from the dashboard for a connector credential, saves it, then downloads and starts the connector. |
 | `/mca status` | Prints the loader version, the current state, the address it talks to, the paired server and network, and the loaded bundle. It never prints the token. |
-| `/mca update` | Checks the release API again and, if it finds a verified connector, restarts the connector on it. The running connector is only stopped once that verified replacement is ready. If a check or update is already running, the second request is ignored with a message. |
+| `/mca update` | Checks the release API again and, if it finds a verified connector, restarts the connector on it. The running connector is only stopped once that verified replacement is ready. If a check or update is already running, the second request is ignored with a message. It also runs the [loader self-update](#loader-self-update) check now, and says whether a newer loader is staged. |
 
 `/mcanalytics` is an alias for `/mca`. Any other subcommand is passed to the running connector.
 
@@ -54,11 +55,25 @@ Older versions read an address from `endpoint_url` / `api_url` in `config.toml`,
 `MCANALYTICS_DASHBOARD_URL` environment variables. All of them are ignored now. When an old config
 file still has one of those keys, the console says so once at startup, and you can delete the line.
 
-One setting remains, and it is optional:
+Two settings remain, and both are optional:
 
 | Key | Where | Default |
 | --- | --- | --- |
+| `auto-update-loader` | `config.yml` (Paper, `plugins/MCAnalyticsLoader/`); `auto_update_loader` in `config.toml` (Velocity, `plugins/mcanalytics-loader/`) | `true` |
 | `MCANALYTICS_API_TOKEN` | environment variable | unset |
+
+`auto-update-loader` switches [loader self-update](#loader-self-update) on or off. It is on when the
+key is missing, when there is no config file, and for any value other than `false`, `no`, `off` or
+`0`. The loader reads the file at every check, so turning it off needs no restart, and it never
+writes to the file: the connector owns it. The default block for the connector config is:
+
+```yaml
+# Update the MCAnalytics loader jar by itself. A verified newer loader is staged and used after
+# the next restart. Set to false to update the loader by hand.
+auto-update-loader: true
+```
+
+On Velocity the same setting in `config.toml` is `auto_update_loader = true`.
 
 `MCANALYTICS_API_TOKEN` lets a container image start already paired. The loader accepts a token that
 starts with `mca_live_` or `mca_test_`. A credential file on disk always wins over the variable.
@@ -70,6 +85,10 @@ Files the loader writes inside its own data folder:
 | `credential.json` | The connector token and the network and server ids. Created owner-only from the first byte (mode 600 on POSIX, an owner-only ACL on Windows). |
 | `cache/connector-<platform>-<version>.jar` | Connector bundles that passed the checksum and signature checks. |
 | `cache/connector-<platform>-<version>.jar.verify.json` | The sha256 and signature the bundle was installed with. The loader checks the jar against it again before every load. |
+
+The only files the loader writes outside its data folder are for self-update, and always inside
+the plugins folder that holds its own jar: `plugins/update/<loader jar name>` on Paper, or
+`<loader jar name>.pending` and `<loader jar name>.pending.verify.json` next to the jar on Velocity.
 
 ## How updates work
 
@@ -121,6 +140,62 @@ any required field is missing or malformed:
   re-checks every 30 minutes.
 - HTTP 401 means the token was revoked. The loader deletes the credential and asks you to pair again.
 
+## Loader self-update
+
+From 1.0.5 the loader keeps itself up to date. Loaders 1.0.4 and older do not check for a newer
+loader, so they need one manual update to 1.0.5 (download the jar from the dashboard and replace
+the old one). After that no manual update is needed unless you turn it off.
+
+**When it checks.** Once the server is paired, the loader asks
+`GET /api/v1/connector/loader/release?platform=<platform>` with its connector token at start and
+then every 6 hours, with 10 percent of random jitter either way. `/mca update` runs the check
+right away. The reply has the same shape and the same validation as the connector release reply
+(`version`, `sha256`, `sizeBytes`, `signature`, `downloadPath`). A 404 means no loader is
+published, and the loader does nothing.
+
+**What it accepts.** A jar is staged only when all of this holds:
+
+- its version is higher than the running loader's, compared as three numbers (`1.0.10` is newer
+  than `1.0.9`). The same or an older version is never staged, so the loader is never downgraded;
+- it downloads from the locked host only, with the same size cap, redirect rule and download-path
+  rule as the connector, and its size and SHA-256 match the reply;
+- its Ed25519 signature verifies under a trusted key compiled into the loader;
+- it is an MCAnalytics loader for this platform and says it is the version the reply named. A
+  validly signed connector jar, or an old signed loader offered under a higher number, is refused.
+
+A jar that fails any check is deleted and nothing is staged. The running loader and the running
+connector are never touched by a check.
+
+**Where it goes.** The loader finds its own jar through its class's code source. If that is not a
+regular `.jar` file with a plain name, it does nothing. It never writes outside the folder that
+holds its own jar.
+
+- **Paper.** The verified jar is written to `plugins/update/` (or the update folder set in
+  `bukkit.yml`, if that is inside `plugins/`) under exactly the file name of the running jar.
+  Paper copies a file of the same name over the plugin before it loads plugins, so the swap
+  happens at the next restart. The jar keeps its old file name, for example
+  `mcanalytics-loader-paper-1.0.4.jar` now holds 1.0.5, and that is fine.
+- **Velocity.** Velocity has no update folder, so the loader does the swap itself, in a way that
+  cannot leave two loaders loaded. The verified jar is written next to the running jar as
+  `<jar name>.pending`, with a record `<jar name>.pending.verify.json` holding its version, sha256
+  and signature. Velocity ignores the file because it only loads `*.jar`. On proxy shutdown, and
+  again at the next start in case the shutdown never ran, the loader verifies the pending jar once
+  more (sha256, signature, loader descriptor, and that it is still newer than the running loader)
+  and then renames it over the running jar's file name in one atomic move. The swap replaces the
+  file instead of adding one, so exactly one loader jar exists at every moment. A pending jar
+  that fails a check, has no record, or is no longer newer is deleted. If the rename fails, for
+  example because the operating system keeps the jar locked, the pending file stays and the console
+  says so; delete nothing and try the next restart, or move the `.pending` file over the jar by
+  hand while the proxy is stopped.
+
+When a jar is staged the console prints one line:
+`MCAnalytics loader X.Y.Z is ready and will be used after the next restart.`
+
+**Turning it off.** Set `auto-update-loader: false` in `config.yml` (Paper) or
+`auto_update_loader = false` in `config.toml` (Velocity). Nothing is downloaded or staged then, and a
+Velocity `.pending` jar left over from earlier is deleted at the next start or shutdown instead of
+installed.
+
 ## Security notes
 
 What the loader downloads: one jar, the MCAnalytics connector for your platform, from
@@ -152,12 +227,18 @@ What the loader never does:
   `127.0.0.1` and `::1`.
 - It never runs a bundle whose checksum or signature does not verify.
 - It never keeps a revoked token: the credential file is deleted, not renamed.
-- It never reads or writes outside its own plugin data folder.
+- It never reads or writes outside its own plugin data folder, with one exception: loader
+  self-update writes a verified newer loader jar inside the plugins folder that holds the loader's
+  own jar (`plugins/update/` on Paper, `<jar>.pending` beside the jar on Velocity), and on Velocity
+  renames that file over the loader's own jar at shutdown or start. It never downgrades the
+  loader, and does nothing when it cannot locate its own jar or when `auto-update-loader` is false.
 - It never contacts the release API before the server is paired.
 
 Limits of these checks: the signature proves a jar was signed by a trusted key, not that it is the
 newest one, so a validly signed older jar in the cache can still be started when the site is
-unreachable. Anyone who can already write to your plugins folder can replace the loader itself,
+unreachable. Loader self-update is stricter than that: it accepts only a version higher than the
+running one, and only a jar whose own descriptor names the announced version, so it cannot be
+used to roll a loader back. Loaders 1.0.4 and older do not update themselves. Anyone who can already write to your plugins folder can replace the loader itself,
 which no check inside the loader can prevent. If the signing key were stolen, jars signed with it
 would be trusted until a loader release removes that key.
 
