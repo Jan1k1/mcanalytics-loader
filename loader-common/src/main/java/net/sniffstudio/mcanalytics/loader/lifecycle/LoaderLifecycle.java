@@ -9,12 +9,12 @@ import net.sniffstudio.mcanalytics.loader.config.ConfigManager;
 import net.sniffstudio.mcanalytics.loader.config.LoaderCredentials;
 import net.sniffstudio.mcanalytics.loader.net.ConnectionProblem;
 import net.sniffstudio.mcanalytics.loader.net.ReleaseClient;
+import net.sniffstudio.mcanalytics.loader.util.BundleVerifier;
 import net.sniffstudio.mcanalytics.loader.util.VersionUtil;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Optional;
@@ -72,11 +72,19 @@ public final class LoaderLifecycle {
      * have no way to reach this constructor.
      */
     LoaderLifecycle(PlatformHandle handle, String endpointOverride, Clock clock) {
+        this(handle, endpointOverride, clock, BundleVerifier.production());
+    }
+
+    /**
+     * For tests only: as above, and {@code verifier} decides which signing keys are trusted, so a
+     * test can sign with a key it generated. Operators have no way to reach this constructor.
+     */
+    LoaderLifecycle(PlatformHandle handle, String endpointOverride, Clock clock, BundleVerifier verifier) {
         this.handle = handle;
         this.logger = handle.logger();
         this.configManager = new ConfigManager(handle.dataDirectory(), handle.logger());
         this.releaseClient = new ReleaseClient(handle.loaderVersion(), handle.platform());
-        this.bundleManager = new BundleManager(handle.dataDirectory());
+        this.bundleManager = new BundleManager(handle.dataDirectory(), verifier, handle.logger());
         this.endpointOverride = endpointOverride;
         this.clock = clock != null ? clock : Clock.systemUTC();
     }
@@ -276,7 +284,7 @@ public final class LoaderLifecycle {
 
                 try {
                     Path targetPath = bundleManager.getBundlePath(handle.platform(), meta.version());
-                    if (bundleManager.isBundleValid(targetPath, meta.sha256())) {
+                    if (bundleManager.matchesRelease(targetPath, meta)) {
                         noteSiteReachable();
                         logger.info("[MCAnalytics] Using cached connector bundle v" + meta.version() + ".");
                         bundleToLoad = targetPath;
@@ -290,7 +298,8 @@ public final class LoaderLifecycle {
                             String downloadUrl = ReleaseClient.resolveDownloadUri(apiUrl, meta.downloadPath()).toString();
                             logger.info("[MCAnalytics] Downloading connector bundle v" + meta.version() + "...");
                             releaseClient.downloadBundle(downloadUrl, credentials.connectorToken(), tempFile, meta.sha256(), meta.sizeBytes());
-                            Files.move(tempFile, targetPath, StandardCopyOption.REPLACE_EXISTING);
+                            // Checks the sha256 and the signature, then moves the jar into the cache.
+                            targetPath = bundleManager.install(tempFile, meta);
                             noteSiteReachable();
                             logger.info("[MCAnalytics] Verified and installed connector bundle v" + meta.version() + ".");
                             bundleToLoad = targetPath;
@@ -352,6 +361,14 @@ public final class LoaderLifecycle {
             }
 
             cancelOfflineRetry();
+
+            // Every load is verified again, including a fresh install and a fallback.
+            String verificationFailure = bundleManager.verificationFailure(bundleToLoad);
+            if (verificationFailure != null) {
+                logger.warn("[MCAnalytics] Not starting " + bundleToLoad.getFileName() + ": " + verificationFailure + ".");
+                state.set(State.FAILED);
+                return;
+            }
 
             try {
                 ClassLoader parentClassLoader = handle.getClass().getClassLoader();
