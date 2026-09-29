@@ -21,6 +21,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ReleaseManifestTest {
 
     private static final String SHA = "ab".repeat(32);
+    private static final String SIG = java.util.Base64.getEncoder().encodeToString(new byte[64]);
 
     private HttpServer server;
     private String baseUrl;
@@ -61,6 +62,7 @@ class ReleaseManifestTest {
                 + "\"sha256\":\"" + SHA + "\","
                 + "\"sizeBytes\":204800,"
                 + "\"downloadPath\":\"/api/v1/connector/release/download?platform=paper\","
+                + "\"signature\":\"" + SIG + "\","
                 + "\"minLoader\":\"1.2.0\"}}";
         respond("/api/v1/connector/release", 200, json.getBytes(StandardCharsets.UTF_8));
 
@@ -76,12 +78,13 @@ class ReleaseManifestTest {
         assertThat(meta.sizeBytes()).isEqualTo(204800L);
         assertThat(meta.downloadPath()).isEqualTo("/api/v1/connector/release/download?platform=paper");
         assertThat(meta.minLoader()).isEqualTo("1.2.0");
+        assertThat(meta.signature()).isEqualTo(SIG);
     }
 
     @Test
     @DisplayName("Defaults minLoader when the manifest omits it")
     void defaultsMissingMinLoader() {
-        String json = "{\"data\":{\"version\":\"2.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}}";
+        String json = "{\"data\":{\"version\":\"2.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":10,\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\"}}";
         respond("/api/v1/connector/release", 200, json.getBytes(StandardCharsets.UTF_8));
 
         ReleaseClient client = new ReleaseClient("1.0.0", "velocity");
@@ -194,7 +197,7 @@ class ReleaseManifestTest {
     @Test
     @DisplayName("A release without a sha256 is refused, not treated as unchecked")
     void refusesMissingChecksum() {
-        ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}");
+        ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"sizeBytes\":10,\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\"}");
 
         assertThat(result.metadata()).isNull();
         assertThat(result.errorMessage()).contains("missing or invalid sha256");
@@ -205,7 +208,7 @@ class ReleaseManifestTest {
     void refusesMalformedChecksum() {
         for (String bad : new String[]{"", "abc123def456", "z".repeat(64), "ab".repeat(32) + "0", "ab".repeat(31)}) {
             ReleaseClient.ReleaseCheckResult result = new ReleaseClient("1.0.0", "paper").checkRelease(
-                    serveOnce("{\"version\":\"1.0.0\",\"sha256\":\"" + bad + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}"),
+                    serveOnce("{\"version\":\"1.0.0\",\"sha256\":\"" + bad + "\",\"sizeBytes\":10,\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\"}"),
                     "paper", "mca_live_token");
             assertThat(result.metadata()).as("sha256 %s", bad).isNull();
         }
@@ -219,13 +222,13 @@ class ReleaseManifestTest {
     @Test
     @DisplayName("A release without a size, or with a size of zero or below, is refused")
     void refusesMissingOrZeroSize() {
-        String noSize = "{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"downloadPath\":\"/dl\"}";
+        String noSize = "{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\"}";
         assertThat(check(noSize).metadata()).isNull();
         assertThat(check(noSize).errorMessage()).contains("missing or invalid size");
 
         for (String size : new String[]{"0", "-5", "\"12\"", "null"}) {
             ReleaseClient.ReleaseCheckResult result = new ReleaseClient("1.0.0", "paper").checkRelease(
-                    serveOnce("{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":" + size + ",\"downloadPath\":\"/dl\"}"),
+                    serveOnce("{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":" + size + ",\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\"}"),
                     "paper", "mca_live_token");
             assertThat(result.metadata()).as("size %s", size).isNull();
         }
@@ -236,7 +239,7 @@ class ReleaseManifestTest {
     void refusesSizeAboveTheLimit() {
         long tooBig = ReleaseClient.MAX_BUNDLE_BYTES + 1;
         ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"sha256\":\"" + SHA
-                + "\",\"sizeBytes\":" + tooBig + ",\"downloadPath\":\"/dl\"}");
+                + "\",\"sizeBytes\":" + tooBig + ",\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\"}");
         assertThat(result.metadata()).isNull();
         assertThat(result.errorMessage()).contains("limit");
     }
@@ -245,7 +248,7 @@ class ReleaseManifestTest {
     @DisplayName("A version that is not x.y.z is refused before it can reach a file name")
     void refusesBadVersion() {
         ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"../../evil\",\"sha256\":\"" + SHA
-                + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}");
+                + "\",\"sizeBytes\":10,\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\"}");
         assertThat(result.metadata()).isNull();
         assertThat(result.errorMessage()).contains("version");
     }
@@ -255,7 +258,7 @@ class ReleaseManifestTest {
     void refusesOversizedReply() {
         String padding = "x".repeat(ReleaseClient.MAX_JSON_BYTES);
         ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"sha256\":\"" + SHA
-                + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\",\"note\":\"" + padding + "\"}");
+                + "\",\"sizeBytes\":10,\"signature\":\"" + SIG + "\",\"downloadPath\":\"/dl\",\"note\":\"" + padding + "\"}");
         assertThat(result.metadata()).isNull();
         assertThat(result.statusCode()).isEqualTo(200);
     }
@@ -404,6 +407,22 @@ class ReleaseManifestTest {
             assertThatThrownBy(() -> ReleaseClient.resolveDownloadUri(base, bad))
                     .as("path %s", bad)
                     .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        }
+    }
+
+    @Test
+    @DisplayName("A release without a signature, or with a malformed one, is refused")
+    void refusesMissingOrMalformedSignature() {
+        String withoutSignature = "{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}";
+        ReleaseClient.ReleaseCheckResult result = check(withoutSignature);
+        assertThat(result.metadata()).isNull();
+        assertThat(result.errorMessage()).contains("signature");
+
+        for (String bad : new String[]{"", "not base64!", java.util.Base64.getEncoder().encodeToString(new byte[63]), "null"}) {
+            String json = "{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\",\"signature\":"
+                    + ("null".equals(bad) ? "null" : "\"" + bad + "\"") + "}";
+            assertThat(new ReleaseClient("1.0.0", "paper").checkRelease(serveOnce(json), "paper", "t").metadata())
+                    .as("signature %s", bad).isNull();
         }
     }
 }

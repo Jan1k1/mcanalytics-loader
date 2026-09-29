@@ -8,6 +8,7 @@ import net.sniffstudio.mcanalytics.loader.api.PlatformHandle;
 import net.sniffstudio.mcanalytics.loader.config.ConfigManager;
 import net.sniffstudio.mcanalytics.loader.config.LoaderCredentials;
 import net.sniffstudio.mcanalytics.loader.api.ConnectorEntrypoint;
+import net.sniffstudio.mcanalytics.loader.testsupport.SigningFixture;
 import net.sniffstudio.mcanalytics.loader.util.ChecksumUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,6 +36,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class LoaderLifecycleTest {
 
+    private final SigningFixture signing = new SigningFixture();
     private HttpServer server;
     private int port;
     private final List<String> loggedMessages = new ArrayList<>();
@@ -140,6 +142,11 @@ class LoaderLifecycleTest {
         return new LoaderLifecycle(handle, "http://127.0.0.1:" + port, Clock.systemUTC());
     }
 
+    /** As {@link #localLifecycle}, trusting only this test's signing key. */
+    private LoaderLifecycle signedLifecycle(PlatformHandle handle) {
+        return new LoaderLifecycle(handle, "http://127.0.0.1:" + port, Clock.systemUTC(), signing.verifier());
+    }
+
     /** A clock the retry and reminder tests can move by hand. */
     private static final class MutableClock extends Clock {
         private Instant now = Instant.parse("2026-09-25T20:28:57Z");
@@ -242,15 +249,14 @@ class LoaderLifecycleTest {
         // Create an existing cached bundle
         Path cacheDir = tempDir.resolve("cache");
         Files.createDirectories(cacheDir);
-        Path cachedBundle = cacheDir.resolve("connector-velocity-1.0.0.jar");
-        Files.writeString(cachedBundle, "dummy-jar-content");
+        signing.seedCache(tempDir, "velocity", "1.0.0", "dummy-jar-content".getBytes(StandardCharsets.UTF_8));
 
         PlatformHandle handle = createMockHandle(tempDir, "velocity");
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "velocity", Instant.now()));
 
         // Nothing listens on port 1.
-        LoaderLifecycle lifecycle = new LoaderLifecycle(handle, "http://127.0.0.1:1", Clock.systemUTC());
+        LoaderLifecycle lifecycle = new LoaderLifecycle(handle, "http://127.0.0.1:1", Clock.systemUTC(), signing.verifier());
         lifecycle.onEnable();
 
         assertThat(loggedMessages).anyMatch(msg -> msg.equals("[INFO] [MCAnalytics] Cannot reach mcanalytics.org right now "
@@ -329,13 +335,13 @@ class LoaderLifecycleTest {
 
         Path cacheDir = tempDir.resolve("cache");
         Files.createDirectories(cacheDir);
-        Files.writeString(cacheDir.resolve("connector-paper-1.0.9.jar"), "dummy-jar-content");
+        signing.seedCache(tempDir, "paper", "1.0.9", "dummy-jar-content".getBytes(StandardCharsets.UTF_8));
 
         PlatformHandle handle = createMockHandle(tempDir, "paper");
         new ConfigManager(tempDir, handle.logger())
                 .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
 
-        LoaderLifecycle lifecycle = localLifecycle(handle);
+        LoaderLifecycle lifecycle = signedLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(loggedMessages).contains("[INFO] [MCAnalytics] Cannot reach mcanalytics.org right now (HTTP 502). "
@@ -675,7 +681,7 @@ class LoaderLifecycleTest {
         byte[] payload = "tampered-bundle-bytes".getBytes(StandardCharsets.UTF_8);
         server.createContext("/api/v1/connector/release", exchange -> {
             String json = "{\"data\":{\"version\":\"3.1.0\",\"sha256\":\"" + "0".repeat(64) + "\",\"sizeBytes\":" + payload.length
-                    + ",\"downloadPath\":\"/api/v1/connector/release/download\",\"minLoader\":\"1.0.0\"}}";
+                    + ",\"downloadPath\":\"/api/v1/connector/release/download\",\"signature\":\"" + signing.sign(payload) + "\",\"minLoader\":\"1.0.0\"}}";
             byte[] response = json.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, response.length);
             try (OutputStream os = exchange.getResponseBody()) {
@@ -693,7 +699,7 @@ class LoaderLifecycleTest {
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
 
-        LoaderLifecycle lifecycle = localLifecycle(handle);
+        LoaderLifecycle lifecycle = signedLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
@@ -711,7 +717,7 @@ class LoaderLifecycleTest {
         String sha = ChecksumUtil.sha256(payload);
         server.createContext("/api/v1/connector/release", exchange -> {
             String json = "{\"data\":{\"version\":\"3.2.0\",\"sha256\":\"" + sha + "\",\"sizeBytes\":" + payload.length
-                    + ",\"downloadPath\":\"/api/v1/connector/release/download\",\"minLoader\":\"1.0.0\"}}";
+                    + ",\"downloadPath\":\"/api/v1/connector/release/download\",\"signature\":\"" + signing.sign(payload) + "\",\"minLoader\":\"1.0.0\"}}";
             byte[] response = json.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, response.length);
             try (OutputStream os = exchange.getResponseBody()) {
@@ -729,12 +735,13 @@ class LoaderLifecycleTest {
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
 
-        LoaderLifecycle lifecycle = localLifecycle(handle);
+        LoaderLifecycle lifecycle = signedLifecycle(handle);
         lifecycle.onEnable();
 
         Path installed = tempDir.resolve("cache").resolve("connector-paper-3.2.0.jar");
         assertThat(installed).exists();
         assertThat(Files.readAllBytes(installed)).isEqualTo(payload);
+        assertThat(installed.resolveSibling("connector-paper-3.2.0.jar.verify.json")).exists();
         assertThat(loggedMessages).anyMatch(msg -> msg.contains("Verified and installed connector bundle v3.2.0"));
         assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
         assertThat(loggedMessages).anyMatch(msg -> msg.contains("Failed to start connector bundle"));
@@ -746,7 +753,7 @@ class LoaderLifecycleTest {
         String sha = ChecksumUtil.sha256(payload);
         server.createContext("/api/v1/connector/release", exchange -> {
             String json = "{\"data\":{\"version\":\"4.0.0\",\"sha256\":\"" + sha + "\",\"sizeBytes\":" + payload.length
-                    + ",\"downloadPath\":\"/api/v1/connector/release/download\",\"minLoader\":\"9.0.0\"}}";
+                    + ",\"downloadPath\":\"/api/v1/connector/release/download\",\"signature\":\"" + signing.sign(payload) + "\",\"minLoader\":\"9.0.0\"}}";
             byte[] response = json.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, response.length);
             try (OutputStream os = exchange.getResponseBody()) {
@@ -764,7 +771,7 @@ class LoaderLifecycleTest {
         ConfigManager config = new ConfigManager(tempDir, handle.logger());
         config.saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
 
-        LoaderLifecycle lifecycle = localLifecycle(handle);
+        LoaderLifecycle lifecycle = signedLifecycle(handle);
         lifecycle.onEnable();
 
         assertThat(loggedMessages).anyMatch(msg -> msg.contains("older than required minLoader 9.0.0"));
@@ -798,7 +805,7 @@ class LoaderLifecycleTest {
         });
         for (String path : new String[]{"@evil.example/x", "//evil.example/x", "http://evil.example/x"}) {
             loggedMessages.clear();
-            serveReleaseReplacing("{\"version\":\"3.3.0\",\"sha256\":\"" + "a".repeat(64) + "\",\"sizeBytes\":10,"
+            serveReleaseReplacing("{\"version\":\"3.3.0\",\"sha256\":\"" + "a".repeat(64) + "\",\"sizeBytes\":10,\"signature\":\"" + signing.sign(new byte[10]) + "\","
                     + "\"downloadPath\":\"" + path + "\",\"minLoader\":\"1.0.0\"}");
 
             PlatformHandle handle = createMockHandle(tempDir, "paper");
@@ -848,5 +855,132 @@ class LoaderLifecycleTest {
             assertThat(loggedMessages).anyMatch(msg -> msg.contains("Release check failed: the release information was refused"));
         }
         assertThat(downloads.get()).isZero();
+    }
+
+    private void serveBundle(byte[] payload, String version, String signature) {
+        String signatureField = signature == null ? "" : "\"signature\":\"" + signature + "\",";
+        serveReleaseReplacing("{\"version\":\"" + version + "\",\"sha256\":\"" + ChecksumUtil.sha256(payload)
+                + "\",\"sizeBytes\":" + payload.length + "," + signatureField
+                + "\"downloadPath\":\"/api/v1/connector/release/download\",\"minLoader\":\"1.0.0\"}");
+        try {
+            server.removeContext("/api/v1/connector/release/download");
+        } catch (IllegalArgumentException ignored) {
+            // nothing served yet
+        }
+        server.createContext("/api/v1/connector/release/download", exchange -> {
+            exchange.sendResponseHeaders(200, payload.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(payload);
+            }
+        });
+    }
+
+    private LoaderLifecycle pairedSignedLifecycle(Path tempDir) throws Exception {
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        new ConfigManager(tempDir, handle.logger())
+                .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+        return signedLifecycle(handle);
+    }
+
+    @Test
+    void aBundleWithABadSignatureIsNeverInstalledOrStarted(@TempDir Path tempDir) throws Exception {
+        byte[] payload = "correct-checksum-wrong-signature".getBytes(StandardCharsets.UTF_8);
+        // Right checksum, right size, but signed by a key the loader does not trust.
+        serveBundle(payload, "5.0.0", SigningFixture.sign(SigningFixture.newKeyPair(), payload));
+
+        LoaderLifecycle lifecycle = pairedSignedLifecycle(tempDir);
+        lifecycle.onEnable();
+
+        assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+        assertThat(loggedMessages).anyMatch(msg -> msg.contains("Failed to download release: Signature verification failed"));
+        assertThat(loggedMessages).noneMatch(msg -> msg.contains("Verified and installed"));
+        try (var stream = Files.list(tempDir.resolve("cache"))) {
+            assertThat(stream).isEmpty();
+        }
+    }
+
+    @Test
+    void aSignatureOverDifferentBytesIsRefused(@TempDir Path tempDir) throws Exception {
+        byte[] payload = "the-served-bytes".getBytes(StandardCharsets.UTF_8);
+        serveBundle(payload, "5.1.0", signing.sign("some-other-jar".getBytes(StandardCharsets.UTF_8)));
+
+        LoaderLifecycle lifecycle = pairedSignedLifecycle(tempDir);
+        lifecycle.onEnable();
+
+        assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+        assertThat(tempDir.resolve("cache").resolve("connector-paper-5.1.0.jar")).doesNotExist();
+    }
+
+    @Test
+    void aBundleWithoutASignatureIsNeverDownloaded(@TempDir Path tempDir) throws Exception {
+        byte[] payload = "unsigned".getBytes(StandardCharsets.UTF_8);
+        serveBundle(payload, "5.2.0", null);
+        AtomicInteger downloads = new AtomicInteger();
+        server.removeContext("/api/v1/connector/release/download");
+        server.createContext("/api/v1/connector/release/download", exchange -> {
+            downloads.incrementAndGet();
+            exchange.sendResponseHeaders(404, -1);
+            exchange.close();
+        });
+
+        LoaderLifecycle lifecycle = pairedSignedLifecycle(tempDir);
+        lifecycle.onEnable();
+
+        assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+        assertThat(loggedMessages).anyMatch(msg -> msg.contains("missing or malformed signature"));
+        assertThat(downloads.get()).isZero();
+    }
+
+    @Test
+    void aTamperedCachedJarIsNotStartedWhenTheSiteIsUnreachable(@TempDir Path tempDir) throws Exception {
+        Path jar = signing.seedCache(tempDir, "paper", "1.0.0", "trusted-jar".getBytes(StandardCharsets.UTF_8));
+        Files.writeString(jar, "malicious-jar");
+
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        new ConfigManager(tempDir, handle.logger())
+                .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+        LoaderLifecycle lifecycle = new LoaderLifecycle(handle, "http://127.0.0.1:1", Clock.systemUTC(), signing.verifier());
+        try {
+            lifecycle.onEnable();
+
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+            assertThat(lifecycle.getClassLoader()).isNull();
+            assertThat(loggedMessages).anyMatch(msg -> msg.contains("Skipping saved connector connector-paper-1.0.0.jar: its checksum does not match"));
+            assertThat(loggedMessages).noneMatch(msg -> msg.contains("Starting the connector already saved"));
+        } finally {
+            lifecycle.onDisable();
+        }
+    }
+
+    @Test
+    void aCachedJarWithoutASidecarIsNotStarted(@TempDir Path tempDir) throws Exception {
+        Files.createDirectories(tempDir.resolve("cache"));
+        Files.writeString(tempDir.resolve("cache").resolve("connector-paper-1.0.0.jar"), "left-by-an-old-loader");
+
+        PlatformHandle handle = createMockHandle(tempDir, "paper");
+        new ConfigManager(tempDir, handle.logger())
+                .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+        LoaderLifecycle lifecycle = new LoaderLifecycle(handle, "http://127.0.0.1:1", Clock.systemUTC(), signing.verifier());
+        try {
+            lifecycle.onEnable();
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+            assertThat(loggedMessages).anyMatch(msg -> msg.contains("no verification record"));
+        } finally {
+            lifecycle.onDisable();
+        }
+    }
+
+    @Test
+    void aCachedJarThatWasChangedAfterTheReleaseCheckIsRepairedByADownload(@TempDir Path tempDir) throws Exception {
+        byte[] payload = "the-real-jar".getBytes(StandardCharsets.UTF_8);
+        Path jar = signing.seedCache(tempDir, "paper", "6.0.0", payload);
+        Files.writeString(jar, "tampered");
+        serveBundle(payload, "6.0.0", signing.sign(payload));
+
+        LoaderLifecycle lifecycle = pairedSignedLifecycle(tempDir);
+        lifecycle.onEnable();
+
+        assertThat(Files.readAllBytes(jar)).isEqualTo(payload);
+        assertThat(loggedMessages).anyMatch(msg -> msg.contains("Verified and installed connector bundle v6.0.0"));
     }
 }

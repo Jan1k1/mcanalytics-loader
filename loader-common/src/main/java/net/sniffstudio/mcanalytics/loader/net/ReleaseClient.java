@@ -1,6 +1,7 @@
 package net.sniffstudio.mcanalytics.loader.net;
 
 import net.sniffstudio.mcanalytics.loader.config.LoaderCredentials;
+import net.sniffstudio.mcanalytics.loader.util.BundleVerifier;
 import net.sniffstudio.mcanalytics.loader.util.ChecksumUtil;
 import net.sniffstudio.mcanalytics.loader.util.TinyJson;
 import net.sniffstudio.mcanalytics.loader.util.VersionUtil;
@@ -89,7 +90,7 @@ public final class ReleaseClient {
 
     public record PairResult(boolean success, int statusCode, LoaderCredentials credentials, String errorMessage) {}
 
-    public record ReleaseMetadata(String platform, String version, String sha256, long sizeBytes, String downloadPath, String minLoader) {}
+    public record ReleaseMetadata(String platform, String version, String sha256, long sizeBytes, String downloadPath, String minLoader, String signature) {}
 
     /**
      * @param errorMessage for an unanswered request, plain words from {@link ConnectionProblem}
@@ -247,6 +248,7 @@ public final class ReleaseClient {
         Long size = TinyJson.getLong(data, "sizeBytes");
         String path = TinyJson.getString(data, "downloadPath");
         String minLoader = TinyJson.getString(data, "minLoader");
+        String signature = TinyJson.getString(data, "signature");
 
         String problem = null;
         if (!VersionUtil.isStrictVersion(ver)) {
@@ -259,6 +261,8 @@ public final class ReleaseClient {
             problem = "a size above the " + (MAX_BUNDLE_BYTES / (1024 * 1024)) + " MB limit";
         } else if (path == null || path.isBlank()) {
             problem = "a missing download path";
+        } else if (!BundleVerifier.isWellFormedSignature(signature)) {
+            problem = "a missing or malformed signature";
         }
         if (problem != null) {
             return new ReleaseCheckResult(status, null, "the release information was refused: it has " + problem);
@@ -269,7 +273,8 @@ public final class ReleaseClient {
                 sha.toLowerCase(java.util.Locale.ROOT),
                 size,
                 path,
-                minLoader != null ? minLoader : "1.0.0"), null);
+                minLoader != null ? minLoader : "1.0.0",
+                signature), null);
     }
 
     /**
