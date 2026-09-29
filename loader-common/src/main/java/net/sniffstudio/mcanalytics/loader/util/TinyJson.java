@@ -7,6 +7,11 @@ import java.util.Map;
 
 public final class TinyJson {
 
+    /** Longest input {@link #parse} accepts, in characters. Release and pairing replies are far smaller. */
+    public static final int MAX_INPUT_LENGTH = 64 * 1024;
+    /** Deepest nesting of objects and arrays {@link #parse} accepts. */
+    public static final int MAX_DEPTH = 32;
+
     private TinyJson() {}
 
     @SuppressWarnings("unchecked")
@@ -15,12 +20,15 @@ public final class TinyJson {
         if (parsed instanceof Map) {
             return (Map<String, Object>) parsed;
         }
-        throw new IllegalArgumentException("JSON root is not an object: " + json);
+        throw new IllegalArgumentException("JSON root is not an object");
     }
 
     public static Object parse(String json) {
         if (json == null) {
             return null;
+        }
+        if (json.length() > MAX_INPUT_LENGTH) {
+            throw new IllegalArgumentException("JSON input is too large");
         }
         return new Parser(json.trim()).parseValue();
     }
@@ -114,6 +122,7 @@ public final class TinyJson {
     private static final class Parser {
         private final String src;
         private int pos = 0;
+        private int depth = 0;
 
         Parser(String src) {
             this.src = src;
@@ -143,10 +152,34 @@ public final class TinyJson {
             if (c == '-' || (c >= '0' && c <= '9')) {
                 return parseNumber();
             }
-            throw new IllegalArgumentException("Unexpected character '" + c + "' at position " + pos);
+            throw new IllegalArgumentException("Unexpected character at position " + pos);
+        }
+
+        private void enter() {
+            if (++depth > MAX_DEPTH) {
+                throw new IllegalArgumentException("JSON is nested too deeply");
+            }
         }
 
         private Map<String, Object> parseObject() {
+            enter();
+            try {
+                return parseObjectBody();
+            } finally {
+                depth--;
+            }
+        }
+
+        private List<Object> parseArray() {
+            enter();
+            try {
+                return parseArrayBody();
+            } finally {
+                depth--;
+            }
+        }
+
+        private Map<String, Object> parseObjectBody() {
             Map<String, Object> map = new LinkedHashMap<>();
             expect('{');
             skipWhitespace();
@@ -176,7 +209,7 @@ public final class TinyJson {
             return map;
         }
 
-        private List<Object> parseArray() {
+        private List<Object> parseArrayBody() {
             List<Object> list = new ArrayList<>();
             expect('[');
             skipWhitespace();
@@ -230,7 +263,11 @@ public final class TinyJson {
                             }
                             String hex = src.substring(pos, pos + 4);
                             pos += 4;
-                            sb.append((char) Integer.parseInt(hex, 16));
+                            try {
+                                sb.append((char) Integer.parseInt(hex, 16));
+                            } catch (NumberFormatException e) {
+                                throw new IllegalArgumentException("Invalid unicode escape");
+                            }
                         }
                         default -> sb.append(esc);
                     }
@@ -288,13 +325,18 @@ public final class TinyJson {
                 }
             }
             String numStr = src.substring(start, pos);
-            if (isDecimal) {
-                return Double.parseDouble(numStr);
-            }
             try {
-                return Long.parseLong(numStr);
+                if (isDecimal) {
+                    return Double.parseDouble(numStr);
+                }
+                try {
+                    return Long.parseLong(numStr);
+                } catch (NumberFormatException e) {
+                    return Double.parseDouble(numStr);
+                }
             } catch (NumberFormatException e) {
-                return Double.parseDouble(numStr);
+                // The library message would repeat the input text.
+                throw new IllegalArgumentException("Invalid number at position " + start);
             }
         }
 
