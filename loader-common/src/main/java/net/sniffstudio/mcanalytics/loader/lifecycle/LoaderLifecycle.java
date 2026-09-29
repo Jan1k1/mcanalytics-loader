@@ -91,6 +91,7 @@ public final class LoaderLifecycle {
 
     public void onEnable() {
         configManager.logIgnoredAddressSettingOnce();
+        configManager.removeStaleCredentialCopies();
         Optional<LoaderCredentials> credentials = configManager.readCredentials();
         if (credentials.isEmpty() || !credentials.get().isComplete()) {
             state.set(State.UNPAIRED);

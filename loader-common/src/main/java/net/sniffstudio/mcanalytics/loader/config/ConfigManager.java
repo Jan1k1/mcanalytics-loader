@@ -8,7 +8,9 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
@@ -177,7 +179,6 @@ public final class ConfigManager {
     public void saveCredentials(LoaderCredentials credentials) throws IOException {
         Files.createDirectories(dataDirectory);
         Path target = dataDirectory.resolve(CREDENTIAL_FILE_NAME);
-        Path tempFile = dataDirectory.resolve(CREDENTIAL_FILE_NAME + ".tmp." + System.currentTimeMillis());
 
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("connectorToken", credentials.connectorToken());
@@ -188,31 +189,75 @@ public final class ConfigManager {
         map.put("pairedAt", credentials.pairedAt() != null ? credentials.pairedAt().toString() : Instant.now().toString());
 
         String json = TinyJson.toJson(map);
-        Files.writeString(tempFile, json, StandardCharsets.UTF_8);
-        FilePermissions.restrictToOwner(tempFile);
-
+        // Owner-only from the first byte: the file is created private, then written, then renamed.
+        Path tempFile = FilePermissions.createPrivateTempFile(dataDirectory, CREDENTIAL_FILE_NAME + ".tmp.", "");
         try {
-            Files.move(tempFile, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(tempFile, target, StandardCopyOption.REPLACE_EXISTING);
+            Files.writeString(tempFile, json, StandardCharsets.UTF_8);
+            try {
+                Files.move(tempFile, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tempFile, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(tempFile);
         }
 
-        if (!FilePermissions.restrictToOwner(target) && FilePermissions.supportsPosix()) {
+        if (!FilePermissions.restrictToOwner(target)) {
             logger.warn("[MCAnalytics] Could not restrict " + target.getFileName() + " to owner-only permissions.");
         }
+        removeStaleCredentialCopies();
     }
 
+    /**
+     * Revokes the stored pairing. The token is removed, not renamed: a revoked token is worthless
+     * to the server but a copy left in the data folder is still a secret an operator would not
+     * expect to find.
+     */
     public void clearCredentials() {
-        Path credFile = dataDirectory.resolve(CREDENTIAL_FILE_NAME);
-        if (Files.isRegularFile(credFile)) {
-            Path revoked = dataDirectory.resolve(CREDENTIAL_FILE_NAME + ".revoked." + System.currentTimeMillis());
-            try {
-                Files.move(credFile, revoked, StandardCopyOption.REPLACE_EXISTING);
-            } catch (IOException e) {
-                try {
-                    Files.deleteIfExists(credFile);
-                } catch (IOException ignored) {}
+        wipeAndDelete(dataDirectory.resolve(CREDENTIAL_FILE_NAME));
+        // readCredentials falls back to this older file, so a revoked token must not survive there.
+        wipeAndDelete(dataDirectory.resolve(LEGACY_CREDENTIAL_FILE_NAME));
+        removeStaleCredentialCopies();
+    }
+
+    /**
+     * Deletes copies of the token that older loaders left behind: {@code credential.json.revoked.*}
+     * and interrupted {@code credential.json.tmp.*} files.
+     *
+     * @return how many files were removed
+     */
+    public int removeStaleCredentialCopies() {
+        int removed = 0;
+        for (String glob : List.of(CREDENTIAL_FILE_NAME + ".revoked.*", CREDENTIAL_FILE_NAME + ".tmp.*")) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(dataDirectory, glob)) {
+                for (Path stale : stream) {
+                    if (wipeAndDelete(stale)) {
+                        removed++;
+                    }
+                }
+            } catch (IOException | RuntimeException ignored) {
             }
+        }
+        return removed;
+    }
+
+    /** Overwrites the file with zeros (best effort) and deletes it. */
+    private static boolean wipeAndDelete(Path file) {
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            return false;
+        }
+        try {
+            long size = Files.size(file);
+            if (size > 0 && size <= 1024 * 1024) {
+                Files.write(file, new byte[(int) size]);
+            }
+        } catch (IOException ignored) {
+        }
+        try {
+            Files.delete(file);
+            return true;
+        } catch (IOException e) {
+            return false;
         }
     }
 
