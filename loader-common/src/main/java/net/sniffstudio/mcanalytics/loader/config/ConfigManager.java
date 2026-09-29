@@ -135,6 +135,14 @@ public final class ConfigManager {
         }
     }
 
+    /**
+     * True for the public address and for the loopback test address, and for nothing else. The
+     * loader refuses to send a token to any other base.
+     */
+    public static boolean isTrustedApiBase(String apiUrl) {
+        return DEFAULT_API_URL.equals(apiUrl) || internalEndpoint(apiUrl) != null;
+    }
+
     public Optional<LoaderCredentials> readCredentials() {
         Path credFile = dataDirectory.resolve(CREDENTIAL_FILE_NAME);
         if (!Files.isRegularFile(credFile)) {

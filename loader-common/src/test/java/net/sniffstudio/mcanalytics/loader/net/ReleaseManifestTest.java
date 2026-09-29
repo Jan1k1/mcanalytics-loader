@@ -20,6 +20,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ReleaseManifestTest {
 
+    private static final String SHA = "ab".repeat(32);
+
     private HttpServer server;
     private String baseUrl;
 
@@ -38,6 +40,11 @@ class ReleaseManifestTest {
     }
 
     private void respond(String path, int status, byte[] body) {
+        try {
+            server.removeContext(path);
+        } catch (IllegalArgumentException ignored) {
+            // no context yet
+        }
         server.createContext(path, exchange -> {
             exchange.sendResponseHeaders(status, body.length);
             try (OutputStream os = exchange.getResponseBody()) {
@@ -51,7 +58,7 @@ class ReleaseManifestTest {
     void parsesValidManifest() {
         String json = "{\"success\":true,\"data\":{"
                 + "\"version\":\"1.4.2\","
-                + "\"sha256\":\"abc123def456\","
+                + "\"sha256\":\"" + SHA + "\","
                 + "\"sizeBytes\":204800,"
                 + "\"downloadPath\":\"/api/v1/connector/release/download?platform=paper\","
                 + "\"minLoader\":\"1.2.0\"}}";
@@ -65,7 +72,7 @@ class ReleaseManifestTest {
         ReleaseClient.ReleaseMetadata meta = result.metadata();
         assertThat(meta.platform()).isEqualTo("paper");
         assertThat(meta.version()).isEqualTo("1.4.2");
-        assertThat(meta.sha256()).isEqualTo("abc123def456");
+        assertThat(meta.sha256()).isEqualTo(SHA);
         assertThat(meta.sizeBytes()).isEqualTo(204800L);
         assertThat(meta.downloadPath()).isEqualTo("/api/v1/connector/release/download?platform=paper");
         assertThat(meta.minLoader()).isEqualTo("1.2.0");
@@ -74,7 +81,7 @@ class ReleaseManifestTest {
     @Test
     @DisplayName("Defaults minLoader when the manifest omits it")
     void defaultsMissingMinLoader() {
-        String json = "{\"data\":{\"version\":\"2.0.0\",\"sha256\":\"deadbeef\",\"downloadPath\":\"/dl\"}}";
+        String json = "{\"data\":{\"version\":\"2.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}}";
         respond("/api/v1/connector/release", 200, json.getBytes(StandardCharsets.UTF_8));
 
         ReleaseClient client = new ReleaseClient("1.0.0", "velocity");
@@ -82,7 +89,7 @@ class ReleaseManifestTest {
 
         assertThat(result.metadata()).isNotNull();
         assertThat(result.metadata().minLoader()).isEqualTo("1.0.0");
-        assertThat(result.metadata().sizeBytes()).isZero();
+        assertThat(result.metadata().sizeBytes()).isEqualTo(10L);
     }
 
     @Test
@@ -174,8 +181,229 @@ class ReleaseManifestTest {
         Path target = tempDir.resolve("bundle.tmp");
         ReleaseClient client = new ReleaseClient("1.0.0", "paper");
 
-        assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "mca_live_token", target, null, 0))
+        assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "mca_live_token", target, SHA, 10))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining("403");
+    }
+
+    private ReleaseClient.ReleaseCheckResult check(String dataJson) {
+        respond("/api/v1/connector/release", 200, ("{\"data\":" + dataJson + "}").getBytes(StandardCharsets.UTF_8));
+        return new ReleaseClient("1.0.0", "paper").checkRelease(baseUrl, "paper", "mca_live_token");
+    }
+
+    @Test
+    @DisplayName("A release without a sha256 is refused, not treated as unchecked")
+    void refusesMissingChecksum() {
+        ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}");
+
+        assertThat(result.metadata()).isNull();
+        assertThat(result.errorMessage()).contains("missing or invalid sha256");
+    }
+
+    @Test
+    @DisplayName("A release with a malformed sha256 is refused")
+    void refusesMalformedChecksum() {
+        for (String bad : new String[]{"", "abc123def456", "z".repeat(64), "ab".repeat(32) + "0", "ab".repeat(31)}) {
+            ReleaseClient.ReleaseCheckResult result = new ReleaseClient("1.0.0", "paper").checkRelease(
+                    serveOnce("{\"version\":\"1.0.0\",\"sha256\":\"" + bad + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}"),
+                    "paper", "mca_live_token");
+            assertThat(result.metadata()).as("sha256 %s", bad).isNull();
+        }
+    }
+
+    private String serveOnce(String dataJson) {
+        respond("/api/v1/connector/release", 200, ("{\"data\":" + dataJson + "}").getBytes(StandardCharsets.UTF_8));
+        return baseUrl;
+    }
+
+    @Test
+    @DisplayName("A release without a size, or with a size of zero or below, is refused")
+    void refusesMissingOrZeroSize() {
+        String noSize = "{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"downloadPath\":\"/dl\"}";
+        assertThat(check(noSize).metadata()).isNull();
+        assertThat(check(noSize).errorMessage()).contains("missing or invalid size");
+
+        for (String size : new String[]{"0", "-5", "\"12\"", "null"}) {
+            ReleaseClient.ReleaseCheckResult result = new ReleaseClient("1.0.0", "paper").checkRelease(
+                    serveOnce("{\"version\":\"1.0.0\",\"sha256\":\"" + SHA + "\",\"sizeBytes\":" + size + ",\"downloadPath\":\"/dl\"}"),
+                    "paper", "mca_live_token");
+            assertThat(result.metadata()).as("size %s", size).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("A declared size above the download limit is refused")
+    void refusesSizeAboveTheLimit() {
+        long tooBig = ReleaseClient.MAX_BUNDLE_BYTES + 1;
+        ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"sha256\":\"" + SHA
+                + "\",\"sizeBytes\":" + tooBig + ",\"downloadPath\":\"/dl\"}");
+        assertThat(result.metadata()).isNull();
+        assertThat(result.errorMessage()).contains("limit");
+    }
+
+    @Test
+    @DisplayName("A version that is not x.y.z is refused before it can reach a file name")
+    void refusesBadVersion() {
+        ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"../../evil\",\"sha256\":\"" + SHA
+                + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\"}");
+        assertThat(result.metadata()).isNull();
+        assertThat(result.errorMessage()).contains("version");
+    }
+
+    @Test
+    @DisplayName("A reply above the JSON size limit is refused")
+    void refusesOversizedReply() {
+        String padding = "x".repeat(ReleaseClient.MAX_JSON_BYTES);
+        ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"sha256\":\"" + SHA
+                + "\",\"sizeBytes\":10,\"downloadPath\":\"/dl\",\"note\":\"" + padding + "\"}");
+        assertThat(result.metadata()).isNull();
+        assertThat(result.statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("A reply nested deeper than the limit is refused without a crash")
+    void refusesDeeplyNestedReply() {
+        String nested = "[".repeat(TinyJsonLimits.DEPTH + 5) + "]".repeat(TinyJsonLimits.DEPTH + 5);
+        ReleaseClient.ReleaseCheckResult result = check("{\"version\":\"1.0.0\",\"x\":" + nested + "}");
+        assertThat(result.metadata()).isNull();
+    }
+
+    private static final class TinyJsonLimits {
+        static final int DEPTH = net.sniffstudio.mcanalytics.loader.util.TinyJson.MAX_DEPTH;
+    }
+
+    @Test
+    @DisplayName("A download with no checksum or no size is never started")
+    void downloadRefusesMissingChecksumOrSize(@TempDir Path tempDir) {
+        respond("/download", 200, "bytes".getBytes(StandardCharsets.UTF_8));
+        ReleaseClient client = new ReleaseClient("1.0.0", "paper");
+        Path target = tempDir.resolve("bundle.tmp");
+
+        assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "t", target, null, 5))
+                .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "t", target, "abc", 5))
+                .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "t", target, SHA, 0))
+                .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "t", target, SHA, -1))
+                .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "t", target, SHA, ReleaseClient.MAX_BUNDLE_BYTES + 1))
+                .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        assertThat(target).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("A body longer than the declared size is cut off and deleted, never fully written")
+    void downloadStopsAtTheDeclaredSize(@TempDir Path tempDir) throws Exception {
+        byte[] body = new byte[200_000];
+        server.createContext("/download", exchange -> {
+            exchange.sendResponseHeaders(200, 0); // chunked, so no Content-Length to check
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(body);
+            } catch (IOException ignored) {
+            }
+        });
+
+        Path target = tempDir.resolve("bundle.tmp");
+        assertThatThrownBy(() -> new ReleaseClient("1.0.0", "paper").downloadBundle(
+                baseUrl + "/download", "t", target, SHA, 1000))
+                .isInstanceOf(ReleaseClient.ReleaseRejectedException.class)
+                .hasMessageContaining("size mismatch");
+        assertThat(target).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("A Content-Length above the declared size is refused")
+    void downloadRefusesLongerContentLength(@TempDir Path tempDir) {
+        respond("/download", 200, new byte[5000]);
+        Path target = tempDir.resolve("bundle.tmp");
+        assertThatThrownBy(() -> new ReleaseClient("1.0.0", "paper").downloadBundle(
+                baseUrl + "/download", "t", target, SHA, 1000))
+                .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        assertThat(target).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("A redirect to another host is refused and the token is never sent there")
+    void neverFollowsARedirectToAnotherHost(@TempDir Path tempDir) throws Exception {
+        java.util.concurrent.atomic.AtomicReference<String> seenAuth = new java.util.concurrent.atomic.AtomicReference<>();
+        HttpServer other = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        other.createContext("/", exchange -> {
+            seenAuth.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+        other.start();
+        try {
+            // localhost and 127.0.0.1 are different hosts to the loader, on the same machine.
+            String target = "http://localhost:" + other.getAddress().getPort() + "/steal";
+            server.createContext("/download", exchange -> {
+                exchange.getResponseHeaders().add("Location", target);
+                exchange.sendResponseHeaders(302, -1);
+                exchange.close();
+            });
+            server.createContext("/api/v1/connector/release", exchange -> {
+                exchange.getResponseHeaders().add("Location", target);
+                exchange.sendResponseHeaders(302, -1);
+                exchange.close();
+            });
+
+            Path tmp = tempDir.resolve("bundle.tmp");
+            ReleaseClient client = new ReleaseClient("1.0.0", "paper");
+            assertThatThrownBy(() -> client.downloadBundle(baseUrl + "/download", "mca_live_secret", tmp, SHA, 10))
+                    .isInstanceOf(ReleaseClient.ReleaseRejectedException.class)
+                    .hasMessageContaining("redirect to another host");
+
+            ReleaseClient.ReleaseCheckResult result = client.checkRelease(baseUrl, "paper", "mca_live_secret");
+            assertThat(result.metadata()).isNull();
+            assertThat(result.statusCode()).isEqualTo(ReleaseClient.STATUS_REFUSED);
+
+            assertThat(seenAuth.get()).isNull();
+        } finally {
+            other.stop(0);
+        }
+    }
+
+    @Test
+    @DisplayName("A redirect inside the same host still works and keeps the token")
+    void followsASameHostRedirect(@TempDir Path tempDir) throws Exception {
+        byte[] payload = "the-bundle".getBytes(StandardCharsets.UTF_8);
+        java.util.concurrent.atomic.AtomicReference<String> seenAuth = new java.util.concurrent.atomic.AtomicReference<>();
+        server.createContext("/moved", exchange -> {
+            exchange.getResponseHeaders().add("Location", "/final");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        server.createContext("/final", exchange -> {
+            seenAuth.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            exchange.sendResponseHeaders(200, payload.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(payload);
+            }
+        });
+
+        Path target = tempDir.resolve("bundle.tmp");
+        new ReleaseClient("1.0.0", "paper").downloadBundle(baseUrl + "/moved", "mca_live_token", target,
+                ChecksumUtil.sha256(payload), payload.length);
+        assertThat(seenAuth.get()).isEqualTo("Bearer mca_live_token");
+        assertThat(Files.readAllBytes(target)).isEqualTo(payload);
+    }
+
+    @Test
+    @DisplayName("A download path must start with exactly one slash and stay on the API host")
+    void resolvesOnlyPathsOnTheApiHost() throws Exception {
+        String base = "https://mcanalytics.org";
+        assertThat(ReleaseClient.resolveDownloadUri(base, "/api/v1/connector/release/download?platform=paper").toString())
+                .isEqualTo("https://mcanalytics.org/api/v1/connector/release/download?platform=paper");
+        assertThat(ReleaseClient.resolveDownloadUri(base, "/@evil.example/x").getHost()).isEqualTo("mcanalytics.org");
+        assertThat(ReleaseClient.resolveDownloadUri("http://127.0.0.1:8080", "/a/../b").toString())
+                .isEqualTo("http://127.0.0.1:8080/b");
+
+        for (String bad : new String[]{"@evil.example/x", "//evil.example/x", "///x", "https://evil.example/x",
+                "evil.example/x", "", "/", null, "\\evil.example\\x", "/\\evil.example", "/a b", ".evil.example", "http://mcanalytics.org/x"}) {
+            assertThatThrownBy(() -> ReleaseClient.resolveDownloadUri(base, bad))
+                    .as("path %s", bad)
+                    .isInstanceOf(ReleaseClient.ReleaseRejectedException.class);
+        }
     }
 }

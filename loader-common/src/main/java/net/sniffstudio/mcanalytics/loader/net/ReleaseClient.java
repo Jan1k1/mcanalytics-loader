@@ -3,7 +3,9 @@ package net.sniffstudio.mcanalytics.loader.net;
 import net.sniffstudio.mcanalytics.loader.config.LoaderCredentials;
 import net.sniffstudio.mcanalytics.loader.util.ChecksumUtil;
 import net.sniffstudio.mcanalytics.loader.util.TinyJson;
+import net.sniffstudio.mcanalytics.loader.util.VersionUtil;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -18,8 +20,20 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Pattern;
+import java.nio.charset.StandardCharsets;
 
 public final class ReleaseClient {
+
+    /** Largest JSON reply the loader reads. Real replies are a few hundred bytes. */
+    public static final int MAX_JSON_BYTES = 64 * 1024;
+    /** Largest connector jar the loader downloads, whatever the server declares. */
+    public static final long MAX_BUNDLE_BYTES = 64L * 1024 * 1024;
+    /** Status a {@link ReleaseCheckResult} carries when the loader refused the reply itself. */
+    public static final int STATUS_REFUSED = -1;
+
+    private static final int MAX_REDIRECTS = 3;
+    private static final Pattern SHA256_HEX = Pattern.compile("[0-9a-fA-F]{64}");
 
     private final HttpClient httpClient;
     private final String userAgent;
@@ -28,7 +42,9 @@ public final class ReleaseClient {
         this.httpClient = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofSeconds(15))
-                .followRedirects(HttpClient.Redirect.NORMAL)
+                // Redirects are followed by hand, and only inside the same origin, so an
+                // Authorization header can never be replayed to another host.
+                .followRedirects(HttpClient.Redirect.NEVER)
                 .build();
         this.userAgent = "MCAnalytics-Loader/" + loaderVersion + " (" + platform + ")";
     }
@@ -81,6 +97,18 @@ public final class ReleaseClient {
      */
     public record ReleaseCheckResult(int statusCode, ReleaseMetadata metadata, String errorMessage) {}
 
+    /**
+     * The loader refused what the server sent: a checksum, size or limit that did not hold, or a
+     * redirect to another host. The message is fixed text, never part of the reply.
+     */
+    public static class ReleaseRejectedException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        public ReleaseRejectedException(String message) {
+            super(message);
+        }
+    }
+
     /** A download that got an answer other than 200. Carries only the status, never the body. */
     public static final class DownloadStatusException extends IOException {
         private static final long serialVersionUID = 1L;
@@ -110,11 +138,12 @@ public final class ReleaseClient {
                     .POST(HttpRequest.BodyPublishers.ofString(TinyJson.toJson(body)))
                     .build();
 
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
             int status = response.statusCode();
+            String responseBody = readBody(response);
 
-            if (status == 200) {
-                Map<String, Object> json = TinyJson.parseObject(response.body());
+            if (status == 200 && responseBody != null) {
+                Map<String, Object> json = TinyJson.parseObject(responseBody);
                 Map<String, Object> data = TinyJson.getObject(json, "data");
                 if (data != null) {
                     String token = TinyJson.getString(data, "connectorToken");
@@ -138,7 +167,7 @@ public final class ReleaseClient {
 
             String errorMsg = "Pairing failed (HTTP " + status + ")";
             try {
-                Map<String, Object> json = TinyJson.parseObject(response.body());
+                Map<String, Object> json = TinyJson.parseObject(responseBody);
                 Map<String, Object> errObj = TinyJson.getObject(json, "error");
                 if (errObj != null) {
                     String msg = TinyJson.getString(errObj, "message");
@@ -158,36 +187,23 @@ public final class ReleaseClient {
     public ReleaseCheckResult checkRelease(String apiUrl, String platform, String token) {
         validateEndpointUrl(apiUrl);
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(apiUrl + "/api/v1/connector/release?platform=" + platform))
-                    .timeout(Duration.ofSeconds(15))
-                    .header("Authorization", "Bearer " + token)
-                    .header("User-Agent", userAgent)
-                    .GET()
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            URI uri = URI.create(apiUrl + "/api/v1/connector/release?platform=" + platform);
+            HttpResponse<InputStream> response = sendGet(uri, token, Duration.ofSeconds(15));
             int status = response.statusCode();
+            String body = readBody(response);
 
             if (status == 200) {
-                Map<String, Object> json = TinyJson.parseObject(response.body());
-                Map<String, Object> data = TinyJson.getObject(json, "data");
+                if (body == null) {
+                    return new ReleaseCheckResult(status, null, "the release information was too large or unreadable");
+                }
+                Map<String, Object> data;
+                try {
+                    data = TinyJson.getObject(TinyJson.parseObject(body), "data");
+                } catch (IllegalArgumentException e) {
+                    return new ReleaseCheckResult(status, null, "the release information could not be read");
+                }
                 if (data != null) {
-                    String ver = TinyJson.getString(data, "version");
-                    String sha = TinyJson.getString(data, "sha256");
-                    Long size = TinyJson.getLong(data, "sizeBytes");
-                    String path = TinyJson.getString(data, "downloadPath");
-                    String minLoader = TinyJson.getString(data, "minLoader");
-
-                    ReleaseMetadata meta = new ReleaseMetadata(
-                            platform,
-                            ver,
-                            sha,
-                            size != null ? size : 0L,
-                            path,
-                            minLoader != null ? minLoader : "1.0.0"
-                    );
-                    return new ReleaseCheckResult(status, meta, null);
+                    return parseRelease(status, platform, data);
                 }
             }
 
@@ -198,7 +214,7 @@ public final class ReleaseClient {
                 return new ReleaseCheckResult(status, null, errorMsg);
             }
             try {
-                Map<String, Object> json = TinyJson.parseObject(response.body());
+                Map<String, Object> json = TinyJson.parseObject(body);
                 Map<String, Object> errObj = TinyJson.getObject(json, "error");
                 if (errObj != null) {
                     String msg = TinyJson.getString(errObj, "message");
@@ -209,6 +225,8 @@ public final class ReleaseClient {
             } catch (Exception ignored) {}
 
             return new ReleaseCheckResult(status, null, errorMsg);
+        } catch (ReleaseRejectedException e) {
+            return new ReleaseCheckResult(STATUS_REFUSED, null, e.getMessage());
         } catch (Exception e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
@@ -217,17 +235,62 @@ public final class ReleaseClient {
         }
     }
 
+    /**
+     * Turns the {@code data} object of a release reply into metadata, or refuses it. A release is
+     * only usable with a strict version, a 64 character sha256, a size above zero and within the
+     * download limit, and a download path; nothing is defaulted, because a default would switch a
+     * check off.
+     */
+    static ReleaseCheckResult parseRelease(int status, String platform, Map<String, Object> data) {
+        String ver = TinyJson.getString(data, "version");
+        String sha = TinyJson.getString(data, "sha256");
+        Long size = TinyJson.getLong(data, "sizeBytes");
+        String path = TinyJson.getString(data, "downloadPath");
+        String minLoader = TinyJson.getString(data, "minLoader");
+
+        String problem = null;
+        if (!VersionUtil.isStrictVersion(ver)) {
+            problem = "a missing or invalid version";
+        } else if (sha == null || !SHA256_HEX.matcher(sha).matches()) {
+            problem = "a missing or invalid sha256";
+        } else if (size == null || size <= 0) {
+            problem = "a missing or invalid size";
+        } else if (size > MAX_BUNDLE_BYTES) {
+            problem = "a size above the " + (MAX_BUNDLE_BYTES / (1024 * 1024)) + " MB limit";
+        } else if (path == null || path.isBlank()) {
+            problem = "a missing download path";
+        }
+        if (problem != null) {
+            return new ReleaseCheckResult(status, null, "the release information was refused: it has " + problem);
+        }
+        return new ReleaseCheckResult(status, new ReleaseMetadata(
+                platform,
+                ver,
+                sha.toLowerCase(java.util.Locale.ROOT),
+                size,
+                path,
+                minLoader != null ? minLoader : "1.0.0"), null);
+    }
+
+    /**
+     * Downloads the jar into {@code tempTarget} and checks it against the release information.
+     * The file is deleted again unless every check passes.
+     *
+     * @param expectedSha256 the 64 hex character checksum from the release information
+     * @param expectedSizeBytes the size from the release information; must be above zero
+     * @throws ReleaseRejectedException when the checksum or size is missing or does not hold, or
+     *         the server redirects to another host
+     */
     public void downloadBundle(String downloadUrl, String token, Path tempTarget, String expectedSha256, long expectedSizeBytes) throws Exception {
         validateEndpointUrl(downloadUrl);
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(downloadUrl))
-                .timeout(Duration.ofSeconds(60))
-                .header("Authorization", "Bearer " + token)
-                .header("User-Agent", userAgent)
-                .GET()
-                .build();
+        if (expectedSha256 == null || !SHA256_HEX.matcher(expectedSha256).matches()) {
+            throw new ReleaseRejectedException("Missing or invalid checksum: the download was not started");
+        }
+        if (expectedSizeBytes <= 0 || expectedSizeBytes > MAX_BUNDLE_BYTES) {
+            throw new ReleaseRejectedException("Missing or invalid size: the download was not started");
+        }
 
-        HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        HttpResponse<InputStream> response = sendGet(URI.create(downloadUrl), token, Duration.ofSeconds(60));
         if (response.statusCode() != 200) {
             try {
                 // Read nothing, only release the connection.
@@ -237,35 +300,152 @@ public final class ReleaseClient {
             throw new DownloadStatusException(response.statusCode());
         }
 
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        long totalBytes = 0;
+        boolean complete = false;
+        try {
+            long declared = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+            if (declared > expectedSizeBytes) {
+                response.body().close();
+                throw new ReleaseRejectedException("Downloaded file size mismatch: the server announced more than the "
+                        + expectedSizeBytes + " bytes it declared");
+            }
 
-        try (InputStream in = response.body(); OutputStream out = Files.newOutputStream(tempTarget)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                out.write(buffer, 0, read);
-                digest.update(buffer, 0, read);
-                totalBytes += read;
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            long totalBytes = 0;
+
+            try (InputStream in = response.body(); OutputStream out = Files.newOutputStream(tempTarget)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    totalBytes += read;
+                    if (totalBytes > expectedSizeBytes) {
+                        // Never write past the declared size, so a hostile stream cannot fill the disk.
+                        throw new ReleaseRejectedException("Downloaded file size mismatch: expected "
+                                + expectedSizeBytes + " bytes, got more");
+                    }
+                    out.write(buffer, 0, read);
+                    digest.update(buffer, 0, read);
+                }
+            }
+
+            if (totalBytes != expectedSizeBytes) {
+                throw new ReleaseRejectedException("Downloaded file size mismatch: expected " + expectedSizeBytes + " bytes, got " + totalBytes);
+            }
+
+            String actualSha256 = ChecksumUtil.sha256Hex(digest.digest());
+            if (!ChecksumUtil.matches(actualSha256, expectedSha256)) {
+                throw new ReleaseRejectedException("Checksum mismatch: expected " + expectedSha256 + ", got " + actualSha256);
+            }
+            complete = true;
+        } finally {
+            if (!complete) {
+                Files.deleteIfExists(tempTarget);
             }
         }
+    }
 
-        if (expectedSizeBytes > 0 && totalBytes != expectedSizeBytes) {
-            Files.deleteIfExists(tempTarget);
-            throw new IOException("Downloaded file size mismatch: expected " + expectedSizeBytes + " bytes, got " + totalBytes);
+    /**
+     * GET with the bearer token. A redirect is followed only when it stays on the origin of the
+     * first request (scheme, host and port); anything else is refused before a second request
+     * exists, so the token never reaches another host.
+     */
+    private HttpResponse<InputStream> sendGet(URI uri, String token, Duration timeout) throws IOException, InterruptedException {
+        URI current = uri;
+        for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(current)
+                    .timeout(timeout)
+                    .header("Authorization", "Bearer " + token)
+                    .header("User-Agent", userAgent)
+                    .GET()
+                    .build();
+            HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+            int status = response.statusCode();
+            if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) {
+                return response;
+            }
+            String location = response.headers().firstValue("Location").orElse(null);
+            try {
+                response.body().close();
+            } catch (IOException ignored) {
+            }
+            URI next;
+            try {
+                next = location == null ? null : current.resolve(location);
+            } catch (IllegalArgumentException e) {
+                next = null;
+            }
+            if (next == null || !sameOrigin(uri, next)) {
+                throw new ReleaseRejectedException("Refused a redirect to another host");
+            }
+            current = next;
         }
+        throw new ReleaseRejectedException("Refused a chain of more than " + MAX_REDIRECTS + " redirects");
+    }
 
-        byte[] hash = digest.digest();
-        StringBuilder sb = new StringBuilder(hash.length * 2);
-        for (byte b : hash) {
-            sb.append(Character.forDigit((b >> 4) & 0xF, 16));
-            sb.append(Character.forDigit(b & 0xF, 16));
+    /** Same scheme, host and port, and no credentials in the address. */
+    static boolean sameOrigin(URI base, URI other) {
+        if (base == null || other == null || other.getUserInfo() != null) {
+            return false;
         }
-        String actualSha256 = sb.toString();
+        return base.getScheme() != null && other.getScheme() != null
+                && base.getScheme().equalsIgnoreCase(other.getScheme())
+                && base.getHost() != null && other.getHost() != null
+                && base.getHost().equalsIgnoreCase(other.getHost())
+                && effectivePort(base) == effectivePort(other);
+    }
 
-        if (expectedSha256 != null && !ChecksumUtil.matches(actualSha256, expectedSha256)) {
-            Files.deleteIfExists(tempTarget);
-            throw new IOException("Checksum mismatch: expected " + expectedSha256 + ", got " + actualSha256);
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() != -1) {
+            return uri.getPort();
+        }
+        return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+    }
+
+    /**
+     * Builds the download address from the configured API base and the path the server sent, or
+     * refuses it. The path must start with exactly one {@code /}: {@code @evil.example/x} and
+     * {@code //evil.example/x} would otherwise move the host. The result must have the scheme,
+     * host and port of the base.
+     *
+     * @throws ReleaseRejectedException when the path would leave the API host
+     */
+    public static URI resolveDownloadUri(String apiBase, String downloadPath) throws ReleaseRejectedException {
+        if (downloadPath == null || downloadPath.length() < 2 || downloadPath.charAt(0) != '/' || downloadPath.charAt(1) == '/') {
+            throw new ReleaseRejectedException("Refused a download path that does not start with a single '/'");
+        }
+        URI base;
+        URI resolved;
+        try {
+            base = URI.create(apiBase);
+            resolved = base.resolve(downloadPath).normalize();
+        } catch (IllegalArgumentException e) {
+            throw new ReleaseRejectedException("Refused a download path that is not a valid address");
+        }
+        if (!sameOrigin(base, resolved)) {
+            throw new ReleaseRejectedException("Refused a download address on another host");
+        }
+        return resolved;
+    }
+
+    /**
+     * Reads at most {@link #MAX_JSON_BYTES} of a reply as UTF-8 text and closes it.
+     *
+     * @return the text, or null when the reply is larger than the limit or cannot be read
+     */
+    private static String readBody(HttpResponse<InputStream> response) {
+        try (InputStream in = response.body()) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                if (out.size() + read > MAX_JSON_BYTES) {
+                    return null;
+                }
+                out.write(buffer, 0, read);
+            }
+            return out.toString(StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return null;
         }
     }
 }
