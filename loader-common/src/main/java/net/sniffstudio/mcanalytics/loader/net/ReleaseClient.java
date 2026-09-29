@@ -33,6 +33,9 @@ public final class ReleaseClient {
     /** Status a {@link ReleaseCheckResult} carries when the loader refused the reply itself. */
     public static final int STATUS_REFUSED = -1;
 
+    /** Where the loader asks for a newer loader jar. */
+    public static final String LOADER_RELEASE_PATH = "/api/v1/connector/loader/release";
+
     private static final int MAX_REDIRECTS = 3;
     private static final Pattern SHA256_HEX = Pattern.compile("[0-9a-fA-F]{64}");
 
@@ -186,9 +189,21 @@ public final class ReleaseClient {
     }
 
     public ReleaseCheckResult checkRelease(String apiUrl, String platform, String token) {
+        return fetchRelease(apiUrl, "/api/v1/connector/release", platform, token);
+    }
+
+    /**
+     * Asks whether a newer loader jar is published. Same token, same reply shape and same
+     * validation as {@link #checkRelease}; a 404 means no loader release is published.
+     */
+    public ReleaseCheckResult checkLoaderRelease(String apiUrl, String platform, String token) {
+        return fetchRelease(apiUrl, LOADER_RELEASE_PATH, platform, token);
+    }
+
+    private ReleaseCheckResult fetchRelease(String apiUrl, String path, String platform, String token) {
         validateEndpointUrl(apiUrl);
         try {
-            URI uri = URI.create(apiUrl + "/api/v1/connector/release?platform=" + platform);
+            URI uri = URI.create(apiUrl + path + "?platform=" + platform);
             HttpResponse<InputStream> response = sendGet(uri, token, Duration.ofSeconds(15));
             int status = response.statusCode();
             String body = readBody(response);

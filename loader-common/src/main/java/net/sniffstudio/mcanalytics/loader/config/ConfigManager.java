@@ -38,6 +38,10 @@ public final class ConfigManager {
     static final List<String> LEGACY_TOML_ADDRESS_KEYS = List.of("endpoint_url", "api_url", "dashboard_url");
     static final List<String> LEGACY_YML_ADDRESS_KEYS = List.of("endpoint-url", "api-url", "dashboard-url");
 
+    /** The self-update switch in config.yml (Paper) and config.toml (Velocity). */
+    public static final String AUTO_UPDATE_KEY_YML = "auto-update-loader";
+    public static final String AUTO_UPDATE_KEY_TOML = "auto_update_loader";
+
     private static final String CREDENTIAL_FILE_NAME = "credential.json";
     private static final String LEGACY_CREDENTIAL_FILE_NAME = "credentials.json";
 
@@ -141,6 +145,69 @@ public final class ConfigManager {
      */
     public static boolean isTrustedApiBase(String apiUrl) {
         return DEFAULT_API_URL.equals(apiUrl) || internalEndpoint(apiUrl) != null;
+    }
+
+    /**
+     * True unless the operator switched loader self-update off. Reads {@code auto-update-loader}
+     * from {@code config.yml} and {@code auto_update_loader} from {@code config.toml} in the data
+     * folder (the Paper and the Velocity connector config). A missing file, a missing key, an
+     * unreadable file and any value other than false, no, off or 0 all mean on.
+     *
+     * <p>The file is read on every call, so a change takes effect at the next check without a
+     * restart. The loader never writes to these files: the connector owns them.
+     */
+    public boolean isAutoUpdateLoaderEnabled() {
+        for (String[] candidate : new String[][]{
+                {"config.yml", AUTO_UPDATE_KEY_YML, AUTO_UPDATE_KEY_TOML},
+                {"config.toml", AUTO_UPDATE_KEY_TOML, AUTO_UPDATE_KEY_YML}}) {
+            Path file = dataDirectory.resolve(candidate[0]);
+            if (!Files.isRegularFile(file)) {
+                continue;
+            }
+            String value = findValue(file, List.of(candidate[1], candidate[2]));
+            if (value != null) {
+                return !isOffValue(value);
+            }
+        }
+        return true;
+    }
+
+    static boolean isOffValue(String raw) {
+        String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        return v.equals("false") || v.equals("no") || v.equals("off") || v.equals("0");
+    }
+
+    /** The value of the first line that sets one of the keys, without quotes and comment; else null. */
+    static String findValue(Path path, List<String> keys) {
+        try {
+            for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("//")) {
+                    continue;
+                }
+                for (String key : keys) {
+                    if (!trimmed.startsWith(key)) {
+                        continue;
+                    }
+                    String rest = trimmed.substring(key.length()).trim();
+                    if (!rest.startsWith(":") && !rest.startsWith("=")) {
+                        continue;
+                    }
+                    String value = rest.substring(1).trim();
+                    int comment = value.indexOf('#');
+                    if (comment >= 0) {
+                        value = value.substring(0, comment).trim();
+                    }
+                    if (value.length() >= 2 && (value.startsWith("\"") && value.endsWith("\"")
+                            || value.startsWith("'") && value.endsWith("'"))) {
+                        value = value.substring(1, value.length() - 1);
+                    }
+                    return value;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     public Optional<LoaderCredentials> readCredentials() {

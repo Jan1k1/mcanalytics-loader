@@ -258,4 +258,37 @@ class ConfigManagerTest {
             assertThat(stream.map(p -> p.getFileName().toString())).containsExactly("config.yml");
         }
     }
+
+    private boolean autoUpdate(Path dir) {
+        return new ConfigManager(dir, SILENT).isAutoUpdateLoaderEnabled();
+    }
+
+    @Test
+    @DisplayName("Loader self-update is on when there is no config file or no key")
+    void autoUpdateDefaultsToOn(@TempDir Path tempDir) throws Exception {
+        assertThat(autoUpdate(tempDir)).isTrue();
+        Files.writeString(tempDir.resolve("config.yml"), "server-name: \"paper\"\ndebug: false\n");
+        assertThat(autoUpdate(tempDir)).isTrue();
+        Files.writeString(tempDir.resolve("config.toml"), "server_name = \"proxy\"\n");
+        assertThat(autoUpdate(tempDir)).isTrue();
+    }
+
+    @Test
+    @DisplayName("Loader self-update is off only for an explicit false in config.yml or config.toml")
+    void autoUpdateOffOnlyWhenSwitchedOff(@TempDir Path tempDir) throws Exception {
+        Path yml = tempDir.resolve("config.yml");
+        for (String off : new String[]{"false", "False", "\"false\"", "no", "off", "0", "false   # keep it manual"}) {
+            Files.writeString(yml, "auto-update-loader: " + off + "\n");
+            assertThat(autoUpdate(tempDir)).as(off).isFalse();
+        }
+        for (String on : new String[]{"true", "yes", "on", "", "banana"}) {
+            Files.writeString(yml, "auto-update-loader: " + on + "\n");
+            assertThat(autoUpdate(tempDir)).as("value '" + on + "'").isTrue();
+        }
+        Files.writeString(yml, "# auto-update-loader: false\n");
+        assertThat(autoUpdate(tempDir)).as("a commented line").isTrue();
+        Files.delete(yml);
+        Files.writeString(tempDir.resolve("config.toml"), "auto_update_loader = false\n");
+        assertThat(autoUpdate(tempDir)).as("toml").isFalse();
+    }
 }
