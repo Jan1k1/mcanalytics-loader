@@ -4,17 +4,20 @@ on:
   push:
     tags: ["v*"]
 
+# Read-only by default. Only the publish job below writes, and it never runs a build.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Build and publish the release
+  build:
+    name: Build and test
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Java 21
         uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
@@ -30,15 +33,19 @@ jobs:
 
       - name: Read the release version from the tag
         id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Check that the tag matches the project version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           built="$(./gradlew --no-daemon --quiet properties | awk '/^version:/ {print $2}')"
-          if [ "$built" != "${{ steps.version.outputs.version }}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match gradle.properties loaderVersion $built"
+          if [ "$built" != "$RELEASE_VERSION" ]; then
+            echo "Tag ${TAG_NAME} does not match gradle.properties loaderVersion $built"
             exit 1
           fi
 
@@ -46,14 +53,38 @@ jobs:
         run: ./gradlew build --no-daemon --stacktrace
 
       - name: Collect the release assets
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          version="${{ steps.version.outputs.version }}"
           mkdir -p release
-          cp "loader-velocity/build/libs/mcanalytics-loader-velocity-${version}.jar" release/
-          cp "loader-paper/build/libs/mcanalytics-loader-paper-${version}.jar" release/
+          cp "loader-velocity/build/libs/mcanalytics-loader-velocity-${RELEASE_VERSION}.jar" release/
+          cp "loader-paper/build/libs/mcanalytics-loader-paper-${RELEASE_VERSION}.jar" release/
           cd release
           sha256sum *.jar > SHA256SUMS
           cat SHA256SUMS
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          if-no-files-found: error
+          path: release/*
+
+  publish:
+    name: Publish the GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download the release assets from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh run download "$RUN_ID" --repo "$REPOSITORY" --name release-assets --dir release
 
       - name: Publish the GitHub release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -61,6 +92,5 @@ jobs:
           draft: false
           fail_on_unmatched_files: true
           files: |
-            release/mcanalytics-loader-velocity-${{ steps.version.outputs.version }}.jar
-            release/mcanalytics-loader-paper-${{ steps.version.outputs.version }}.jar
+            release/*.jar
             release/SHA256SUMS
