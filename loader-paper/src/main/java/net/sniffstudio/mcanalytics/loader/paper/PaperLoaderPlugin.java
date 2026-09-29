@@ -130,6 +130,15 @@ public class PaperLoaderPlugin extends JavaPlugin implements PlatformHandle {
     }
 
     @Override
+    public Path updateFolder() {
+        try {
+            return getServer().getUpdateFolderFile().toPath();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    @Override
     public LoaderLogger logger() {
         return loaderLogger;
     }

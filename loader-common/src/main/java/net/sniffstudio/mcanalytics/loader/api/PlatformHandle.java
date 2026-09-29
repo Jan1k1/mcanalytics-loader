@@ -15,4 +15,12 @@ public interface PlatformHandle {
     Object rawPlugin();
     void setCommandDelegate(CommandDelegate delegate);
     CommandDelegate getCommandDelegate();
+
+    /**
+     * The folder the platform swaps updated plugin jars in from at the next start (Paper's update
+     * folder), or null when the platform has none or the loader should use {@code plugins/update}.
+     */
+    default Path updateFolder() {
+        return null;
+    }
 }
