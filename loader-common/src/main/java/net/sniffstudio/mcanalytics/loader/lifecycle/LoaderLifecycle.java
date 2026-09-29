@@ -24,6 +24,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 public final class LoaderLifecycle {
 
@@ -39,6 +40,8 @@ public final class LoaderLifecycle {
     static final Duration OFFLINE_RETRY_INTERVAL = Duration.ofMinutes(2);
     /** How often a still failing retry repeats its short reminder. */
     static final Duration OFFLINE_REMINDER_INTERVAL = Duration.ofMinutes(30);
+    /** How often a refused or failed update is tried again when the cause is not the connection. */
+    static final Duration UPDATE_RETRY_INTERVAL = Duration.ofMinutes(30);
 
     private final PlatformHandle handle;
     private final ConfigManager configManager;
@@ -56,6 +59,15 @@ public final class LoaderLifecycle {
     });
     private ScheduledFuture<?> pausedRecheckTask;
     private ScheduledFuture<?> offlineRetryTask;
+    private Duration offlineRetryTaskInterval;
+    /**
+     * Held for the whole of a release check, start, stop or update, so two of them can never
+     * interleave and run two connectors.
+     */
+    private final ReentrantLock lifecycleLock = new ReentrantLock();
+    private volatile boolean disabled;
+    /** True while a connector runs but the last attempt to check for a newer one failed. */
+    private volatile boolean updateRetryPending;
     /** Clock millis of the last offline line, or -1 while the site is reachable. */
     private volatile long lastOfflineNoticeMillis = -1;
 
@@ -98,6 +110,7 @@ public final class LoaderLifecycle {
     }
 
     public void onEnable() {
+        disabled = false;
         configManager.logIgnoredAddressSettingOnce();
         configManager.removeStaleCredentialCopies();
         Optional<LoaderCredentials> credentials = configManager.readCredentials();
@@ -111,11 +124,26 @@ public final class LoaderLifecycle {
     }
 
     public void onDisable() {
+        disabled = true;
         cancelPausedRecheck();
         cancelOfflineRetry();
         recheckScheduler.shutdownNow();
-        stopRunningBundle();
-        state.set(State.UNPAIRED);
+        // Wait a little for a check that is running, then stop whatever is running regardless. A
+        // check that finishes later sees the disabled flag and starts nothing.
+        boolean locked = false;
+        try {
+            locked = lifecycleLock.tryLock(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        try {
+            stopRunningBundle();
+            state.set(State.UNPAIRED);
+        } finally {
+            if (locked) {
+                lifecycleLock.unlock();
+            }
+        }
     }
 
     private void stopRunningBundle() {
@@ -149,7 +177,7 @@ public final class LoaderLifecycle {
             pausedRecheckTask = recheckScheduler.scheduleWithFixedDelay(() -> {
                 if (state.get() == State.PAUSED_NO_PLAN) {
                     logger.info("[MCAnalytics] Re-checking plan status...");
-                    handle.asyncExecutor().execute(() -> runReleaseCheckAndLoad(credentials));
+                    handle.asyncExecutor().execute(() -> runReleaseCheckIfIdle(credentials));
                 }
             }, 30, 30, TimeUnit.MINUTES);
         } catch (RejectedExecutionException ignored) {
@@ -168,21 +196,35 @@ public final class LoaderLifecycle {
      * could not be reached. Stops on its own once a connector is running.
      */
     private synchronized void scheduleOfflineRetry(LoaderCredentials credentials) {
+        scheduleRetry(credentials, OFFLINE_RETRY_INTERVAL);
+    }
+
+    /**
+     * Runs the release check again every {@code interval} while there is no connector to run
+     * (state FAILED) or a running connector could not be checked for a newer one. A pending
+     * retry with another interval is replaced.
+     */
+    private synchronized void scheduleRetry(LoaderCredentials credentials, Duration interval) {
         if (offlineRetryTask != null && !offlineRetryTask.isDone()) {
-            return;
+            if (interval.equals(offlineRetryTaskInterval)) {
+                return;
+            }
+            offlineRetryTask.cancel(false);
         }
-        long minutes = OFFLINE_RETRY_INTERVAL.toMinutes();
+        long minutes = interval.toMinutes();
         try {
             offlineRetryTask = recheckScheduler.scheduleWithFixedDelay(() -> {
-                if (state.get() == State.FAILED) {
-                    handle.asyncExecutor().execute(() -> runReleaseCheckAndLoad(credentials));
+                if (state.get() == State.FAILED || updateRetryPending) {
+                    handle.asyncExecutor().execute(() -> runReleaseCheckIfIdle(credentials));
                 }
             }, minutes, minutes, TimeUnit.MINUTES);
+            offlineRetryTaskInterval = interval;
         } catch (RejectedExecutionException ignored) {
         }
     }
 
     private synchronized void cancelOfflineRetry() {
+        updateRetryPending = false;
         if (offlineRetryTask != null) {
             offlineRetryTask.cancel(false);
             offlineRetryTask = null;
@@ -236,8 +278,46 @@ public final class LoaderLifecycle {
         }
     }
 
+    /** Runs the release check and starts what it finds, waiting for any check already running. */
     public void runReleaseCheckAndLoad(LoaderCredentials credentials) {
-        state.set(State.CHECKING);
+        lifecycleLock.lock();
+        try {
+            runReleaseCheckLocked(credentials, false);
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
+    /**
+     * As {@link #runReleaseCheckAndLoad}, but does nothing when a check, start or stop is already
+     * running: the next scheduled run tries again.
+     *
+     * @return false when it did nothing because the lifecycle was busy
+     */
+    boolean runReleaseCheckIfIdle(LoaderCredentials credentials) {
+        if (!lifecycleLock.tryLock()) {
+            return false;
+        }
+        try {
+            runReleaseCheckLocked(credentials, false);
+            return true;
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
+    /**
+     * The release check. The caller holds {@link #lifecycleLock}. A running connector is only
+     * stopped once a verified replacement is ready to start, so a reply that is refused, a site
+     * that is down or a failed download never turns a running connector off.
+     *
+     * @param restartIfSame restart the connector even when the newest version is the one running
+     */
+    private void runReleaseCheckLocked(LoaderCredentials credentials, boolean restartIfSame) {
+        boolean connectorRunning = entrypoint != null;
+        if (!connectorRunning) {
+            state.set(State.CHECKING);
+        }
         try {
             String apiUrl = apiUrl();
             String dashboardUrl = configManager.resolveDashboardUrl(apiUrl);
@@ -252,6 +332,7 @@ public final class LoaderLifecycle {
                 noteSiteReachable();
                 cancelOfflineRetry();
                 logger.info("[MCAnalytics] Network has no active plan. Analytics is paused. Pick a plan at " + dashboardUrl + ".");
+                stopRunningBundle();
                 state.set(State.PAUSED_NO_PLAN);
                 schedulePausedRecheck(credentials);
                 return;
@@ -265,6 +346,7 @@ public final class LoaderLifecycle {
                 logger.info("[MCAnalytics] Connector token was revoked, so this server is no longer paired. "
                         + "Run '" + CONSOLE_PAIR_COMMAND + "' in the console to pair it again.");
                 configManager.clearCredentials();
+                stopRunningBundle();
                 state.set(State.UNPAIRED);
                 return;
             }
@@ -334,6 +416,20 @@ public final class LoaderLifecycle {
                         + (checkResult.errorMessage() != null ? checkResult.errorMessage() : "HTTP " + checkResult.statusCode()));
             }
 
+            if (bundleToLoad == null && connectorRunning) {
+                // Nothing newer could be verified. The running connector stays on, and the check
+                // is repeated later; a refused reply must not cost the server its analytics.
+                if (unreachableReason != null) {
+                    logger.info("[MCAnalytics] Cannot reach " + ConnectionProblem.PUBLIC_HOST + " right now ("
+                            + unreachableReason + "). The connector that is running stays on.");
+                } else {
+                    logger.warn("[MCAnalytics] No newer verified connector is available. The connector that is running stays on.");
+                }
+                updateRetryPending = true;
+                scheduleRetry(credentials, unreachableReason != null ? OFFLINE_RETRY_INTERVAL : UPDATE_RETRY_INTERVAL);
+                return;
+            }
+
             if (bundleToLoad == null) {
                 Optional<Path> cached = bundleManager.findNewestValidCachedBundle(handle.platform());
                 if (unreachableReason != null) {
@@ -350,10 +446,12 @@ public final class LoaderLifecycle {
                     if (unreachableReason != null) {
                         scheduleOfflineRetry(credentials);
                     } else {
-                        // Not a connection problem, so trying again on a timer would only repeat it.
-                        cancelOfflineRetry();
+                        // A refused reply may be fixed on the server side, so try again later
+                        // instead of staying off until someone restarts.
+                        scheduleRetry(credentials, UPDATE_RETRY_INTERVAL);
                         logger.warn("[MCAnalytics] No verified connector is available, so analytics is off. "
-                                + "Run /mca update to try again. If this keeps happening, open a ticket in our Discord: "
+                                + "The loader tries again every " + UPDATE_RETRY_INTERVAL.toMinutes()
+                                + " minutes, or run /mca update to try now. If this keeps happening, open a ticket in our Discord: "
                                 + ConnectionProblem.DISCORD_URL);
                     }
                     return;
@@ -366,8 +464,29 @@ public final class LoaderLifecycle {
             String verificationFailure = bundleManager.verificationFailure(bundleToLoad);
             if (verificationFailure != null) {
                 logger.warn("[MCAnalytics] Not starting " + bundleToLoad.getFileName() + ": " + verificationFailure + ".");
-                state.set(State.FAILED);
+                if (connectorRunning) {
+                    updateRetryPending = true;
+                    scheduleRetry(credentials, UPDATE_RETRY_INTERVAL);
+                } else {
+                    state.set(State.FAILED);
+                }
                 return;
+            }
+
+            if (disabled) {
+                return;
+            }
+
+            ConnectorClassLoader running = classLoader;
+            if (connectorRunning && running != null && !restartIfSame && running.getBundleJar().toAbsolutePath().normalize()
+                    .equals(bundleToLoad.toAbsolutePath().normalize())) {
+                // Already running the newest verified version.
+                state.set(State.ACTIVE);
+                return;
+            }
+            if (connectorRunning) {
+                state.set(State.CHECKING);
+                stopRunningBundle();
             }
 
             try {
@@ -388,7 +507,9 @@ public final class LoaderLifecycle {
         } catch (Throwable t) {
             String message = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
             logger.error("[MCAnalytics] " + message, t);
-            state.set(State.FAILED);
+            if (entrypoint == null) {
+                state.set(State.FAILED);
+            }
         }
     }
 
@@ -422,13 +543,16 @@ public final class LoaderLifecycle {
                 ReleaseClient.PairResult result = releaseClient.pair(apiUrl, code, handle.platform());
 
                 if (result.success() && result.credentials() != null) {
+                    lifecycleLock.lock();
                     try {
                         configManager.saveCredentials(result.credentials());
                         stopRunningBundle();
                         sender.sendMessage("[MCAnalytics] Successfully paired server! Fetching connector bundle...");
-                        runReleaseCheckAndLoad(result.credentials());
+                        runReleaseCheckLocked(result.credentials(), false);
                     } catch (IOException e) {
                         sender.sendMessage("[MCAnalytics] Failed to save credentials to disk: " + e.getMessage());
+                    } finally {
+                        lifecycleLock.unlock();
                     }
                 } else {
                     sender.sendMessage("[MCAnalytics] " + result.errorMessage());
@@ -457,8 +581,16 @@ public final class LoaderLifecycle {
 
             sender.sendMessage("[MCAnalytics] Checking for a connector update...");
             handle.asyncExecutor().execute(() -> {
-                stopRunningBundle();
-                runReleaseCheckAndLoad(stored.get());
+                if (!lifecycleLock.tryLock()) {
+                    sender.sendMessage("[MCAnalytics] An update or start is already in progress, so this request was ignored.");
+                    return;
+                }
+                try {
+                    // The running connector is replaced only after a verified new one is ready.
+                    runReleaseCheckLocked(stored.get(), true);
+                } finally {
+                    lifecycleLock.unlock();
+                }
                 sender.sendMessage("[MCAnalytics] Update check finished. Connector state: " + state.get() + ".");
             });
             return true;
