@@ -48,6 +48,10 @@ public final class ChecksumUtil {
         return actual.trim().equalsIgnoreCase(expected.trim());
     }
 
+    public static String sha256Hex(byte[] digest) {
+        return toHex(digest);
+    }
+
     private static String toHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) {

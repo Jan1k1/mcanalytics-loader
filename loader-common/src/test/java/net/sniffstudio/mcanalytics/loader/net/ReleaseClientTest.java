@@ -129,7 +129,7 @@ class ReleaseClientTest {
         try {
             String url = "http://127.0.0.1:" + server.getAddress().getPort() + "/api/v1/connector/release/download";
             assertThatThrownBy(() -> new ReleaseClient("1.0.0", "paper")
-                    .downloadBundle(url, "mca_live_test", tempDir.resolve("bundle.tmp"), null, 0))
+                    .downloadBundle(url, "mca_live_test", tempDir.resolve("bundle.tmp"), "ab".repeat(32), 10))
                     .isInstanceOfSatisfying(ReleaseClient.DownloadStatusException.class,
                             e -> assertThat(e.statusCode()).isEqualTo(503));
         } finally {

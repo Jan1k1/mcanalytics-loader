@@ -283,7 +283,11 @@ public final class LoaderLifecycle {
                     } else {
                         Path tempFile = Files.createTempFile(bundleManager.getCacheDir(), "connector-dl-", ".tmp");
                         try {
-                            String downloadUrl = apiUrl + meta.downloadPath();
+                            if (!ConfigManager.isTrustedApiBase(apiUrl)) {
+                                throw new ReleaseClient.ReleaseRejectedException("Refused to send the token to an untrusted address");
+                            }
+                            // Throws for a path that would move the request to another host.
+                            String downloadUrl = ReleaseClient.resolveDownloadUri(apiUrl, meta.downloadPath()).toString();
                             logger.info("[MCAnalytics] Downloading connector bundle v" + meta.version() + "...");
                             releaseClient.downloadBundle(downloadUrl, credentials.connectorToken(), tempFile, meta.sha256(), meta.sizeBytes());
                             Files.move(tempFile, targetPath, StandardCopyOption.REPLACE_EXISTING);
@@ -372,8 +376,7 @@ public final class LoaderLifecycle {
     }
 
     private static boolean isIntegrityFailure(IOException e) {
-        String message = e.getMessage();
-        return message != null && (message.startsWith("Checksum mismatch") || message.startsWith("Downloaded file size mismatch"));
+        return e instanceof ReleaseClient.ReleaseRejectedException;
     }
 
     /**

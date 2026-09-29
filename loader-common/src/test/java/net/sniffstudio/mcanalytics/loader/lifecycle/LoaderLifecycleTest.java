@@ -770,4 +770,83 @@ class LoaderLifecycleTest {
         assertThat(loggedMessages).anyMatch(msg -> msg.contains("older than required minLoader 9.0.0"));
         assertThat(tempDir.resolve("cache").resolve("connector-paper-4.0.0.jar")).exists();
     }
+
+    private void serveRelease(String dataJson) {
+        try {
+            server.removeContext("/api/v1/connector/release");
+        } catch (IllegalArgumentException ignored) {
+            // nothing served yet
+        }
+        server.createContext("/api/v1/connector/release", exchange -> {
+            byte[] response = ("{\"data\":" + dataJson + "}").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response);
+            }
+        });
+    }
+
+    @Test
+    void aDownloadPathThatMovesTheHostNeverSendsTheToken(@TempDir Path tempDir) throws Exception {
+        AtomicInteger hits = new AtomicInteger();
+        server.createContext("/", exchange -> {
+            if (!exchange.getRequestURI().getPath().startsWith("/api/v1/connector/release")) {
+                hits.incrementAndGet();
+            }
+            exchange.sendResponseHeaders(404, -1);
+            exchange.close();
+        });
+        for (String path : new String[]{"@evil.example/x", "//evil.example/x", "http://evil.example/x"}) {
+            loggedMessages.clear();
+            serveReleaseReplacing("{\"version\":\"3.3.0\",\"sha256\":\"" + "a".repeat(64) + "\",\"sizeBytes\":10,"
+                    + "\"downloadPath\":\"" + path + "\",\"minLoader\":\"1.0.0\"}");
+
+            PlatformHandle handle = createMockHandle(tempDir, "paper");
+            new ConfigManager(tempDir, handle.logger())
+                    .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+            LoaderLifecycle lifecycle = localLifecycle(handle);
+            lifecycle.onEnable();
+
+            assertThat(lifecycle.getState()).as(path).isEqualTo(LoaderLifecycle.State.FAILED);
+            assertThat(loggedMessages).as(path).anyMatch(msg -> msg.contains("Failed to download release: Refused a download path"));
+            assertThat(loggedMessages).noneMatch(msg -> msg.contains("mca_live_test"));
+            assertThat(hits.get()).as(path).isZero();
+            try (var stream = Files.list(tempDir.resolve("cache"))) {
+                assertThat(stream).isEmpty();
+            }
+        }
+    }
+
+    private void serveReleaseReplacing(String dataJson) {
+        serveRelease(dataJson);
+    }
+
+    @Test
+    void aReleaseWithoutChecksumOrSizeIsNotDownloaded(@TempDir Path tempDir) throws Exception {
+        AtomicInteger downloads = new AtomicInteger();
+        server.createContext("/api/v1/connector/release/download", exchange -> {
+            downloads.incrementAndGet();
+            exchange.sendResponseHeaders(200, 3);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(new byte[3]);
+            }
+        });
+        String[] replies = {
+                "{\"version\":\"3.4.0\",\"sizeBytes\":3,\"downloadPath\":\"/api/v1/connector/release/download\"}",
+                "{\"version\":\"3.4.0\",\"sha256\":\"" + "a".repeat(64) + "\",\"downloadPath\":\"/api/v1/connector/release/download\"}",
+        };
+        for (String reply : replies) {
+            loggedMessages.clear();
+            serveReleaseReplacing(reply);
+            PlatformHandle handle = createMockHandle(tempDir, "paper");
+            new ConfigManager(tempDir, handle.logger())
+                    .saveCredentials(new LoaderCredentials("mca_live_test", "net-1", "srv-1", "lobby", "paper", Instant.now()));
+            LoaderLifecycle lifecycle = localLifecycle(handle);
+            lifecycle.onEnable();
+
+            assertThat(lifecycle.getState()).isEqualTo(LoaderLifecycle.State.FAILED);
+            assertThat(loggedMessages).anyMatch(msg -> msg.contains("Release check failed: the release information was refused"));
+        }
+        assertThat(downloads.get()).isZero();
+    }
 }
