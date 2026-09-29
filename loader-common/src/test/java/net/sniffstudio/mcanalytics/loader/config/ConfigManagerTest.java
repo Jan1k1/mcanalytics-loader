@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -187,5 +188,74 @@ class ConfigManagerTest {
 
         assertThat(config.readCredentials()).isEmpty();
         assertThat(tempDir.resolve("credential.json")).doesNotExist();
+    }
+
+    @Test
+    @EnabledIf("posixSupported")
+    @DisplayName("A private temp file is owner-only from the moment it exists")
+    void privateTempFileIsOwnerOnlyFromCreation(@TempDir Path tempDir) throws Exception {
+        Path file = FilePermissions.createPrivateTempFile(tempDir, "credential.json.tmp.", "");
+
+        assertThat(Files.size(file)).isZero();
+        assertThat(Files.getPosixFilePermissions(file)).containsExactlyInAnyOrder(
+                PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
+    }
+
+    @Test
+    @EnabledIf("posixSupported")
+    @DisplayName("Saving over an existing wide-open file leaves owner-only permissions and no stray files")
+    void saveReplacesAWorldReadableFileWithAPrivateOne(@TempDir Path tempDir) throws Exception {
+        Path target = tempDir.resolve("credential.json");
+        Files.writeString(target, "{}");
+        Files.setPosixFilePermissions(target, PosixFilePermissions.fromString("rw-r--r--"));
+
+        ConfigManager config = new ConfigManager(tempDir, SILENT);
+        config.saveCredentials(new LoaderCredentials("mca_live_abc", "net-7", "srv-7", "lobby", "paper", Instant.now()));
+
+        assertThat(Files.getPosixFilePermissions(target)).containsExactlyInAnyOrder(
+                PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
+        try (var stream = Files.list(tempDir)) {
+            assertThat(stream.map(p -> p.getFileName().toString())).containsExactly("credential.json");
+        }
+    }
+
+    @Test
+    @DisplayName("Clearing a credential deletes the token instead of keeping a revoked copy")
+    void clearKeepsNoRevokedCopy(@TempDir Path tempDir) throws Exception {
+        ConfigManager config = new ConfigManager(tempDir, SILENT);
+        config.saveCredentials(new LoaderCredentials("mca_live_abc", "net-7", "srv-7", "lobby", "paper", Instant.now()));
+        config.clearCredentials();
+
+        try (var stream = Files.list(tempDir)) {
+            assertThat(stream).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("Clearing also removes the older credentials.json, which would otherwise be read again")
+    void clearRemovesTheLegacyFileToo(@TempDir Path tempDir) throws Exception {
+        String token = "{\"connectorToken\":\"mca_live_old\",\"networkId\":\"n\",\"serverId\":\"s\",\"platform\":\"paper\"}";
+        Files.writeString(tempDir.resolve("credentials.json"), token);
+        ConfigManager config = new ConfigManager(tempDir, SILENT);
+        assertThat(config.readCredentials()).isPresent();
+
+        config.clearCredentials();
+
+        assertThat(tempDir.resolve("credentials.json")).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("Revoked and interrupted copies left by older loaders are removed")
+    void staleCopiesAreRemoved(@TempDir Path tempDir) throws Exception {
+        Files.writeString(tempDir.resolve("credential.json.revoked.1700000000000"), "mca_live_old");
+        Files.writeString(tempDir.resolve("credential.json.tmp.1700000000001"), "mca_live_old");
+        Files.writeString(tempDir.resolve("config.yml"), "keep: me");
+
+        ConfigManager config = new ConfigManager(tempDir, SILENT);
+        assertThat(config.removeStaleCredentialCopies()).isEqualTo(2);
+
+        try (var stream = Files.list(tempDir)) {
+            assertThat(stream.map(p -> p.getFileName().toString())).containsExactly("config.yml");
+        }
     }
 }
