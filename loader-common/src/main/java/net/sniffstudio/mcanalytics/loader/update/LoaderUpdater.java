@@ -102,19 +102,36 @@ public final class LoaderUpdater {
         return folder.toAbsolutePath().normalize();
     }
 
-    /** The version of the jar already staged for the next restart, if there is a valid one. */
+    /**
+     * The newest version already waiting for a restart: a valid staged jar, or the jar on disk
+     * under the running jar's name when it is newer than the running loader (a swap that already
+     * happened but has not been restarted into yet).
+     */
     public Optional<String> stagedVersion() {
+        Optional<String> best = Optional.empty();
+        try {
+            byte[] onDisk = readJar(runningJar);
+            if (onDisk != null) {
+                best = LoaderJarDescriptor.loaderVersion(onDisk, platform);
+            }
+        } catch (IOException | RuntimeException ignored) {
+            // Not readable: it counts for nothing.
+        }
+        Optional<String> staged = Optional.empty();
         try {
             if (usesUpdateFolder()) {
-                Path target = updateFolder().resolve(jarName());
-                byte[] existing = readJar(target);
-                return existing == null ? Optional.empty() : LoaderJarDescriptor.loaderVersion(existing, platform);
+                byte[] existing = readJar(updateFolder().resolve(jarName()));
+                staged = existing == null ? Optional.empty() : LoaderJarDescriptor.loaderVersion(existing, platform);
+            } else if (applyCheck(pendingPath(), pendingRecordPath()).isEmpty()) {
+                staged = readPendingVersion();
             }
-            Path pending = pendingPath();
-            return applyCheck(pending, pendingRecordPath()).isEmpty() ? readPendingVersion() : Optional.empty();
-        } catch (IOException | RuntimeException e) {
-            return Optional.empty();
+        } catch (IOException | RuntimeException ignored) {
+            // Not readable: it counts for nothing.
         }
+        if (staged.isPresent() && (best.isEmpty() || VersionUtil.isNewer(best.get(), staged.get()))) {
+            best = staged;
+        }
+        return best;
     }
 
     /**
