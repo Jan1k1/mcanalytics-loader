@@ -1,0 +1,6 @@
+name: MCAnalyticsLoader
+main: net.sniffstudio.mcanalytics.loader.bungee.BungeeLoaderPlugin
+version: ${version}
+author: SniffStudio
+description: Downloads, verifies and runs the MCAnalytics connector on a BungeeCord or Waterfall proxy
+softDepends: [floodgate, NuVotifier]

@@ -1,6 +1,6 @@
 # MCAnalytics Loader
 
-A small open source plugin for Velocity proxies and Paper servers. It pairs your server with an
+A small open source plugin for Velocity and BungeeCord proxies and Paper servers. It pairs your server with an
 MCAnalytics network, downloads the MCAnalytics connector, checks the download against the checksum
 and the Ed25519 signature the server published, and runs it. After that it keeps the connector up to date, and from
 loader 1.0.5 it updates itself too (see [Loader self-update](#loader-self-update)), so you never have to replace a jar
@@ -11,7 +11,8 @@ MCAnalytics software and is not part of this repository. See [Security notes](#s
 
 ## Install
 
-1. Download `mcanalytics-loader-velocity-<version>.jar` (Velocity proxy) or
+1. Download `mcanalytics-loader-velocity-<version>.jar` (Velocity proxy),
+   `mcanalytics-loader-bungee-<version>.jar` (BungeeCord or Waterfall proxy) or
    `mcanalytics-loader-paper-<version>.jar` (Paper or Folia server) from the
    [Releases](https://github.com/Jan1k1/mcanalytics-loader/releases) page.
 2. Drop the jar in your `plugins` folder and start the server. The console prints
@@ -20,7 +21,9 @@ MCAnalytics software and is not part of this repository. See [Security notes](#s
    `mca pair <code>` in the server console, without a slash (the Velocity console does not
    accept one). The loader saves the credential, downloads the connector, and starts it.
 
-The Velocity jar goes on the proxy. The Paper jar goes on each backend server you want to measure.
+The Velocity or BungeeCord jar goes on the proxy. The Paper jar goes on each backend server you want to
+measure. Folia uses the Paper jar: the loader and the connector it downloads use Folia's region
+schedulers there.
 
 ## Commands
 
@@ -59,7 +62,7 @@ Two settings remain, and both are optional:
 
 | Key | Where | Default |
 | --- | --- | --- |
-| `auto-update-loader` | `config.yml` (Paper, `plugins/MCAnalyticsLoader/`); `auto_update_loader` in `config.toml` (Velocity, `plugins/mcanalytics-loader/`) | `true` |
+| `auto-update-loader` | `config.yml` (Paper, `plugins/MCAnalyticsLoader/`); `auto_update_loader` in `config.toml` (Velocity, `plugins/mcanalytics-loader/`; BungeeCord, `plugins/MCAnalyticsLoader/`) | `true` |
 | `MCANALYTICS_API_TOKEN` | environment variable | unset |
 
 `auto-update-loader` switches [loader self-update](#loader-self-update) on or off. It is on when the
@@ -175,10 +178,10 @@ holds its own jar.
   Paper copies a file of the same name over the plugin before it loads plugins, so the swap
   happens at the next restart. The jar keeps its old file name, for example
   `mcanalytics-loader-paper-1.0.4.jar` now holds 1.0.5, and that is fine.
-- **Velocity.** Velocity has no update folder, so the loader does the swap itself, in a way that
+- **Velocity and BungeeCord.** Neither has an update folder, so the loader does the swap itself, in a way that
   cannot leave two loaders loaded. The verified jar is written next to the running jar as
   `<jar name>.pending`, with a record `<jar name>.pending.verify.json` holding its version, sha256
-  and signature. Velocity ignores the file because it only loads `*.jar`. On proxy shutdown, and
+  and signature. Both proxies ignore the file because they only load `*.jar`. On proxy shutdown, and
   again at the next start in case the shutdown never ran, the loader verifies the pending jar once
   more (sha256, signature, loader descriptor, and that it is still newer than the running loader)
   and then renames it over the running jar's file name in one atomic move. The swap replaces the
@@ -264,6 +267,7 @@ The jars land in:
 ```
 loader-velocity/build/libs/mcanalytics-loader-velocity-<version>.jar
 loader-paper/build/libs/mcanalytics-loader-paper-<version>.jar
+loader-bungee/build/libs/mcanalytics-loader-bungee-<version>.jar
 ```
 
 `./gradlew test` runs the tests on their own. The Gradle wrapper checks the Gradle download against a
@@ -276,6 +280,7 @@ Modules:
 | `loader-common` | Config and credential handling, the release client, checksum and signature verification, the bundle cache, the isolated classloader, and the lifecycle and command logic. No platform code. |
 | `loader-velocity` | The Velocity plugin entry point and command bridge. |
 | `loader-paper` | The Paper and Folia plugin entry point and command bridge. |
+| `loader-bungee` | The BungeeCord and Waterfall plugin entry point and command bridge. |
 
 Pinned API versions:
 
@@ -283,8 +288,9 @@ Pinned API versions:
 | --- | --- | --- |
 | Velocity API | `3.3.0-SNAPSHOT` | Velocity publishes its API only as a snapshot. There is no release build to pin instead. |
 | Paper API | `1.20.4-R0.1-SNAPSHOT` | Paper publishes its API only as a snapshot. The loader targets API level 1.20 and runs on later Paper builds. |
+| BungeeCord API | `1.20-R0.2` | A release on Maven Central. Waterfall implements the same API. |
 
-Both are compile-only, so neither ends up in the shipped jars. The build compiles to Java 17
+All three are compile-only, so none ends up in the shipped jars. The build compiles to Java 17
 bytecode on a Java 21 toolchain, so the jars run on any server on Java 17 or newer.
 
 ## Licence

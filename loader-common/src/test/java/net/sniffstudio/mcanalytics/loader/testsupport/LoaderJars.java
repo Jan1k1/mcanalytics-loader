@@ -21,6 +21,11 @@ public final class LoaderJars {
                 + version + "\"}", padding);
     }
 
+    public static byte[] bungee(String version, String padding) {
+        return zip("bungee.yml", "name: MCAnalyticsLoader\nmain: net.sniffstudio.mcanalytics.loader.bungee.BungeeLoaderPlugin\nversion: "
+                + version + "\n", padding);
+    }
+
     /** A jar without a loader descriptor, such as a connector bundle. */
     public static byte[] connector(String padding) {
         return zip("connector.txt", "connector", padding);

@@ -59,6 +59,7 @@ jobs:
           mkdir -p release
           cp "loader-velocity/build/libs/mcanalytics-loader-velocity-${RELEASE_VERSION}.jar" release/
           cp "loader-paper/build/libs/mcanalytics-loader-paper-${RELEASE_VERSION}.jar" release/
+          cp "loader-bungee/build/libs/mcanalytics-loader-bungee-${RELEASE_VERSION}.jar" release/
           cd release
           sha256sum *.jar > SHA256SUMS
           cat SHA256SUMS

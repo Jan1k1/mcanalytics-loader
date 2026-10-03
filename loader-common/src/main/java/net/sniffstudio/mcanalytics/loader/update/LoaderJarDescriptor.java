@@ -32,8 +32,9 @@ final class LoaderJarDescriptor {
     /** The version the jar declares as the MCAnalytics loader for {@code platform}, if it is one. */
     static Optional<String> loaderVersion(byte[] jar, String platform) {
         try {
-            if ("paper".equals(platform)) {
-                String yaml = readEntry(jar, "plugin.yml");
+            if ("paper".equals(platform) || "bungee".equals(platform)) {
+                // Paper reads plugin.yml, BungeeCord bungee.yml; both name the loader MCAnalyticsLoader.
+                String yaml = readEntry(jar, "paper".equals(platform) ? "plugin.yml" : "bungee.yml");
                 if (yaml == null) {
                     return Optional.empty();
                 }

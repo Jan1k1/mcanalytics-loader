@@ -20,6 +20,7 @@ class LoaderUpdaterTest {
 
     private static final String PAPER_JAR = "mcanalytics-loader-paper-1.0.4.jar";
     private static final String VELOCITY_JAR = "mcanalytics-loader-velocity-1.0.4.jar";
+    private static final String BUNGEE_JAR = "mcanalytics-loader-bungee-1.0.4.jar";
 
     private final SigningFixture signing = new SigningFixture();
 
@@ -343,5 +344,35 @@ class LoaderUpdaterTest {
         assertThat(LoaderJarLocator.locate(String.class)).as("boot class").isEmpty();
         assertThat(LoaderJarLocator.locate(org.junit.jupiter.api.Test.class)).as("class from a jar").isPresent()
                 .get().satisfies(p -> assertThat(p.getFileName().toString()).endsWith(".jar"));
+    }
+
+    // ---- BungeeCord ---------------------------------------------------------------------
+
+    @Test
+    @DisplayName("BungeeCord: no update folder, so the jar is staged as <jar>.pending and swapped in like on Velocity")
+    void bungeeStagesAndAppliesAPendingFile(@TempDir Path root) throws Exception {
+        Path plugins = plugins(root, BUNGEE_JAR);
+        byte[] jar = LoaderJars.bungee("1.0.6", "new");
+        LoaderUpdater updater = updater("bungee", "1.0.4", plugins, BUNGEE_JAR, null);
+
+        assertThat(updater.stage(download(root, jar), meta("bungee", "1.0.6", jar)).outcome()).isEqualTo(LoaderUpdater.Outcome.STAGED);
+        assertThat(names(plugins)).containsExactlyInAnyOrder(BUNGEE_JAR, BUNGEE_JAR + ".pending", BUNGEE_JAR + ".pending.verify.json");
+
+        LoaderUpdater.ApplyResult result = updater.applyPending();
+        assertThat(result.outcome()).isEqualTo(LoaderUpdater.ApplyOutcome.APPLIED);
+        assertThat(names(plugins)).containsExactly(BUNGEE_JAR);
+        assertThat(Files.readAllBytes(plugins.resolve(BUNGEE_JAR))).isEqualTo(jar);
+    }
+
+    @Test
+    @DisplayName("BungeeCord: a Paper or Velocity loader jar is not accepted as the BungeeCord loader")
+    void bungeeRefusesOtherPlatformsLoaders(@TempDir Path root) throws Exception {
+        Path plugins = plugins(root, BUNGEE_JAR);
+        LoaderUpdater updater = updater("bungee", "1.0.4", plugins, BUNGEE_JAR, null);
+        for (byte[] jar : new byte[][] {LoaderJars.paper("1.0.6", "p"), LoaderJars.velocity("1.0.6", "v")}) {
+            assertThat(updater.stage(download(root, jar), meta("bungee", "1.0.6", jar)).outcome())
+                    .isNotEqualTo(LoaderUpdater.Outcome.STAGED);
+        }
+        assertThat(names(plugins)).containsExactly(BUNGEE_JAR);
     }
 }
