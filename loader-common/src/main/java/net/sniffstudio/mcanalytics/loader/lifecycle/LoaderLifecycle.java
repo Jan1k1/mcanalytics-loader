@@ -214,12 +214,12 @@ public final class LoaderLifecycle {
     }
 
     /**
-     * Velocity only. Swaps in a loader jar that an earlier check left as {@code .pending}, or
+     * Velocity and BungeeCord, which have no update folder. Swaps in a loader jar that an earlier check left as {@code .pending}, or
      * deletes it when the operator has since turned self-update off. Runs at shutdown and again
      * at start, in case the shutdown never got to run.
      */
     private void finishPendingLoaderUpdate(String when) {
-        if (!"velocity".equals(handle.platform())) {
+        if (!"velocity".equals(handle.platform()) && !"bungee".equals(handle.platform())) {
             return;
         }
         try {

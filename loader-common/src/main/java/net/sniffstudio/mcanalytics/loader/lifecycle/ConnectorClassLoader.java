@@ -100,6 +100,7 @@ public class ConnectorClassLoader extends URLClassLoader {
         String wellKnown = switch (platform.toLowerCase()) {
             case "velocity" -> "net.sniffstudio.mcanalytics.connector.velocity.VelocityConnectorEntrypoint";
             case "paper" -> "net.sniffstudio.mcanalytics.connector.paper.PaperConnectorEntrypoint";
+            case "bungee" -> "net.sniffstudio.mcanalytics.connector.bungee.BungeeConnectorEntrypoint";
             default -> null;
         };
 
